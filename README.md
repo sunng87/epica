@@ -41,23 +41,36 @@ Point `:load-path` at this checkout and load the pieces you want:
 
 ```elisp
 (use-package epica
-  :vc (:url "https://github.com/<you>/epica")
+  :vc (:url "https://github.com/<you>/epica" :lisp-dir "lisp")
   :after gptel
   :config
   (require 'epica-tools)
   (require 'epica-ui))
 ```
+
+`:lisp-dir "lisp"` is **required** — production code lives in `lisp/`
+and package-vc defaults to the repo root. (Verified end-to-end against
+this repo: install → `require 'epica` / `epica-tools` / `epica-ui` all
+load. Also note: only `lisp/epica.el` carries a `Package-Requires`
+header — sub-files must not, because package-vc merges headers from
+every `.el` and a self-reference breaks activation.)
 
 ### straight.el
 
 ```elisp
 (use-package epica
-  :straight (epica :type git :host github :repo "<you>/epica")
+  :straight (epica :type git :host github :repo "<you>/epica"
+                   :files ("lisp/*.el"))   ; production code lives in lisp/
   :after gptel
   :config
   (require 'epica-tools)
   (require 'epica-ui))
 ```
+
+`:files ("lisp/*.el")` is **required** — straight's default recipe looks
+at the repo root only. String patterns are flattened into the package
+directory (paths lose their subdirectory), so all four `.el` files land
+on load-path directly.
 
 ### After install
 
