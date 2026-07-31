@@ -2,8 +2,13 @@
 
 ;; Author: nsun
 ;; Version: 0.0.1
-;; Package-Requires: ((emacs "29.1") (epica) (eshell))
 ;; Keywords: ai tools convenience
+;;
+;; NOTE: no Package-Requires header here on purpose. Only the main file
+;; (epica.el) declares package requirements; package-vc merges headers
+;; from EVERY .el in the package, and a self-reference ((epica) here)
+;; would make the merged description require itself -> infinite
+;; activation recursion. Runtime requires are plain `require' forms.
 
 ;; The four tools that make epica emacs-native rather than "another file
 ;; agent": they operate on LIVE buffers, ride buffer-undo-list for free
