@@ -249,7 +249,7 @@ streaming fully meets the loop's needs — confirmed by a passing spike
 that streams tokens, executes a buffer-native tool, feeds the result
 back, and streams the final answer. See [[Build order]] step 1 findings.
 
-Detailed findings from the spike (all now baked into ~spike/spike.el~):
+Detailed findings from the spike (all now baked into ~test/spike/spike.el~):
 
 - *Local-first dev unblocked.* The llama.cpp multi-model router is
   OpenAI-compatible; ~gptel-make-openai~ targets it with ~:host
@@ -493,7 +493,7 @@ Detailed findings from the spike (all now baked into ~spike/spike.el~):
 1. *Provider spike.* ✅ DONE. gptel streaming + tool-use confirmed; the
    loop runs fully on the local llama.cpp router with no API key. Exit
    criterion met: tokens stream into a buffer and a tool call round-trips.
-   See ~spike/spike.el~ and the gptel section findings above.
+   See ~test/spike/spike.el~ and the gptel section findings above.
 2. *~define-epica-tool~ + minimal loop.* ✅ DONE. ~define-epica-tool~
    macro + the async agent loop + the hook surface are in ~epica.el~;
    ~test-step2.el~ proves a model-defined tool runs through the loop

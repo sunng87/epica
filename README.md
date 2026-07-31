@@ -24,7 +24,7 @@ Point `:load-path` at this checkout and load the pieces you want:
 
 ```elisp
 (use-package epica
-  :load-path "~/src/epica"        ; <-- path to this repository
+  :load-path "~/src/epica/lisp"   ; <-- production code lives in lisp/
   :ensure gptel
   :after gptel
   :config
@@ -33,7 +33,7 @@ Point `:load-path` at this checkout and load the pieces you want:
 
 ;; optional: the example extension (destructive-command gate + redaction)
 ;; (use-package epica-ext-demo
-;;   :load-path "~/src/epica"
+;;   :load-path "~/src/epica/lisp"
 ;;   :after epica)
 ```
 
@@ -73,8 +73,9 @@ Point `:load-path` at this checkout and load the pieces you want:
    (add-hook 'epica-session-start-hook (lambda () (epica-minor-mode 1)))
    ```
 
-The `.env` file and `run-step*.sh` scripts are **test-harness-only** —
-real integration never touches them.
+The `.env` file and everything under `test/` (suites, runners, the
+step-1 spike) are **test-harness-only** — real integration never
+touches them. Production code lives in `lisp/`.
 
 ---
 
@@ -222,7 +223,7 @@ There is no epica-specific key storage: gptel's auth is epica's auth.
 
 ### Test harness — `.env` + `epica-default-backend`
 
-The automated suites (`test-step*.el`, `run-step*.sh`) cannot assume an
+The automated suites (`test/test-step*.el`, `test/run-step*.sh`) cannot assume an
 interactive gptel setup, so they pick a backend themselves:
 `epica-default-backend` uses **DeepSeek when `DEEPSEEK_API_KEY` is set,
 else the local llama.cpp router** (no-key fallback). The runners source
@@ -230,7 +231,7 @@ else the local llama.cpp router** (no-key fallback). The runners source
 
 ```bash
 cp .env.example .env          # fill in DEEPSEEK_API_KEY
-./run-step2.sh                # uses DeepSeek; no key → local router
+./test/run-step2.sh           # uses DeepSeek; no key → local router
 ```
 
 `.env` is gitignored — the key never reaches git. If you prefer, set

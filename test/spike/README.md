@@ -1,6 +1,6 @@
 # epica gptel provider spike
 
-Validates build step 1 of `../design.org`: that gptel's streaming +
+Validates build step 1 of `../../design.org`: that gptel's streaming +
 tool-use loop is suitable as epica's provider backend.
 
 ## What it proves
@@ -35,12 +35,12 @@ local model id works without code changes.
 
 ## Layout
 
-- `install-gptel.el` — installs gptel into a project-local `.elpa/`
+- `install-gptel.el` — installs gptel into `test/elpa/`
   (does not touch `~/.emacs.d`)
 - `spike.el` — the spike itself
 - `run.sh` — entrypoint
 
-## Findings (recorded in `../design.org`)
+## Findings (recorded in `../../design.org`)
 
 - gptel's tool-use streaming fits epica's loop. Confirmed working.
 - `gptel-model` must be a **symbol**; `intern` model ids.

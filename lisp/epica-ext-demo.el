@@ -22,7 +22,11 @@
   "Log of results redacted by the demo hook: (TIME . RESULT).")
 
 (defcustom epica-ext-destructive-patterns
-  '("\\brm\\b" "\\bsudo\\b" "\\bmkfs\\b" "\\bdd if=\\|\\bshred\\b\\|\\b> /dev/sd")
+  ;; note: models try to bypass gates (find -delete, unlink, ...) —
+  ;; cover the common deletion verbs, not just rm
+  '("\\brm\\b" "\\bsudo\\b" "\\bmkfs\\b" "\\bshred\\b"
+    "\\bunlink\\b" "\\brmdir\\b" "\\btruncate\\b"
+    "\\bfind\\b.*\\b-delete\\b" "\\bdd if=")
   "Regexes that mark a shell-run command as destructive."
   :type '(repeat regexp) :group 'epica)
 

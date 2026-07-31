@@ -7,7 +7,7 @@
 
 ;; Project-local package dir (absolute, resolved relative to this file)
 (setq package-user-dir
-      (expand-file-name ".elpa" (file-name-directory
+      (expand-file-name "elpa" (file-name-directory
                                  (file-truename load-file-name))))
 
 ;; MELPA + GNU

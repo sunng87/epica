@@ -6,7 +6,7 @@
 authinfo*
 
 # --- build artifacts / vendored deps ---
-spike/.elpa/
+test/elpa/
 *.elc
 *.eln
 
