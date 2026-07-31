@@ -1,0 +1,15 @@
+# --- secrets ---
+.env
+.env.local
+*.key
+*.pem
+authinfo*
+
+# --- build artifacts / vendored deps ---
+spike/.elpa/
+*.elc
+*.eln
+
+# --- stray session files that could land in the project dir ---
+*.org~
+/agent-sessions/

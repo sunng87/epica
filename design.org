@@ -1,0 +1,559 @@
+#+title: epica — an Emacs-native coding agent
+#+author: nsun
+#+options: toc:2 num:nil
+
+* Motivation
+
+epica is a coding-agent harness, in the family of tools like ~pi~, but
+built natively on Emacs primitives rather than on a shell + filesystem
+foundation.
+
+Concretely: where pi ships ~read~/~write~/~edit~/~bash~ operating on
+files off disk and a fresh bash process per call, epica uses
+*buffers*, *overlays*, *narrowing*, a *stateful eshell*, and Emacs'
+existing code-intelligence tooling (~xref~, ~project.el~, ~dired~,
+~magit~) as its tool layer.
+
+The design philosophy transfers directly: aggressively extensible,
+minimal core, everything else buildable as extensions. The deep insight
+is that this is already Emacs' design philosophy — so the "extension
+system" is not something we invent, it's hooks + advice + minor modes.
+
+* Goals
+
+- *Buffer-native tools.* The agent edits the buffer the user sees, not a
+  file on disk that the user must re-open.
+- *Free undo.* Edits ride on ~buffer-undo-list~ / ~undo-tree~; proposed
+  edits render as overlays the user accepts or rejects.
+- *Stateful shell.* A persistent eshell session carries env, cwd, and
+  defined functions across tool calls.
+- *Reuse Emacs' code intelligence.* ~xref~, ~project-find-regexp~,
+  ~imenu~, ~flycheck~ / ~eglot~ become tools, not text-parsing shims.
+- *Minimal core, hook-driven extension.* Every decision point in the
+  agent loop fires a hook. No bespoke extension loader; Emacs *is* the
+  extension system.
+- *Sessions as an org buffer.* One heading per turn, branching = clone
+  subtree. Tree navigation, compaction, search all fall out for free.
+- *Reuse the provider layer.* We do /not/ reimplement HTTP/SSE/auth for
+  30 providers. We build on [[https://github.com/karthink/gptel][gptel]].
+
+* Non-goals (for v1)
+
+- A custom provider/HTTP layer.
+- A bespoke extension module loader.
+- Reinvented tokenizers (approximate is fine for v1).
+- Feature-parity with pi's full surface area. We ship a tight core and
+  let hooks carry the rest.
+
+* Why Emacs is an unusually good host
+
+These are the concrete, structural advantages — not aesthetics.
+
+1. *Live buffer edits.* pi's ~edit~ does exact-string match
+   (~oldText~→~newText~) against a file on disk; fragile on whitespace
+   and invisible to the user until re-opened. epica edits the live
+   buffer the user is viewing; undo is free; proposed edits show as
+   overlays to accept/reject.
+2. *Narrowing as context management.* pi fakes "show the model part of
+   the file" with ~offset~/~limit~ line math. Emacs has
+   ~narrow-to-region~ — the agent's view and the user's view can be the
+   same narrowed region.
+3. *Markers for edit stability.* If the buffer changes between plan and
+   apply (user typing, another edit landing), markers track. pi re-reads
+   and hopes the text still matches.
+4. *Stateful eshell.* pi's ~bash~ is stateless by necessity. An eshell
+   session buffer keeps real state across calls.
+5. *Code-intelligence tools for free.* ~xref-find-definitions~,
+   ~xref-find-references~, ~project-find-regexp~, ~imenu~, flymake/
+   eglot diagnostics become tools — no shell-out-and-parse.
+6. *The extension surface is Emacs itself.* pi had to invent a TS-module
+   loader, an ~ExtensionAPI~, registration, hot-reload. Emacs already
+   has ~define-minor-mode~, ~advice-add~, and hooks. Our "extensions"
+   are just Emacs packages that ~add-hook~ to epica's hooks.
+
+The last point is the tell that this is the right substrate: pi's
+philosophy ("minimal core, everything via extensions") *is* Emacs'
+philosophy. We are not porting the philosophy; we are realizing it in
+the environment it was originally written for.
+
+* Architecture mapping: pi → epica
+
+| pi abstraction                        | epica (Emacs-native) equivalent                            |
+|---------------------------------------|------------------------------------------------------------|
+| ~AgentSession~ (lifecycle, history)   | EIEIO class + a conversation org buffer                    |
+| ~Agent~ (LLM loop)                    | Elisp non-blocking state machine (timers + SSE filters)    |
+| ~ModelRuntime~ (30+ providers)        | =reused= via gptel                                          |
+| Session as JSONL tree                 | Org buffer: heading per turn, subtree = branch              |
+| ~read~ tool (file → string)           | ~epica-read-buffer~ (live buffer, respect narrowing)        |
+| ~edit~ tool (~oldText~/~newText~)     | ~epica-edit-region~ (overlay + ~buffer-undo-list~)          |
+| ~write~ tool                          | ~epica-write-buffer~ (~write-file~ / ~insert~)              |
+| ~bash~ (stateless subprocess)         | ~epica-eshell-run~ (stateful session buffer)                |
+| ~grep~/~find~/~ls~                    | ~project-find-regexp~, ~xref~, ~dired~                      |
+| Tools (typebox schema)                | ~define-epica-tool~ macro → JSON Schema plist               |
+| Extensions (TS modules + loader)      | Emacs packages + hooks + advice (no loader needed)          |
+| Events (~pi.on(...)~)                 | hooks: ~epica-tool-call-hook~, ~epica-turn-start-hook~…     |
+| Skills (~SKILL.md~)                   | identical — read markdown files (Agent Skills standard)     |
+| Slash commands                        | ~transient~ + ~completing-read~                             |
+| Compaction (summarize old turns)      | Elisp walking the org session buffer                        |
+
+* Core abstractions
+
+** The agent loop
+
+A non-blocking state machine. Emacs is single-threaded and cooperative;
+we cannot block the UI for a 30-second turn. The loop:
+
+1. Build request from session buffer (turns ≤ compaction point) +
+   system prompt + active tools.
+2. Submit via gptel streaming; parse SSE in a process filter.
+3. As ~tool_use~ blocks arrive, queue them; render text deltas into the
+   conversation buffer live.
+4. When the assistant message completes: fire ~epica-turn-end-hook~,
+   then dispatch each tool call through ~epica-tool-call-hook~ (which
+   may block/mutate), execute, append results as a tool-result turn.
+5. Loop until the model returns no tool calls; fire
+   ~epica-agent-settled-hook~.
+
+Yield to Emacs redisplay between steps via ~sit-for~ / timers. Never
+block.
+
+** Tools
+
+#+begin_src emacs-lisp
+;; Sketch — not final API.
+(defmacro define-epica-tool (name arglist docstring schema &rest body)
+  "Define an epica tool NAME with parameter SCHEMA (JSON Schema plist)."
+  ...)
+#+end_src
+
+A tool returns a plist ~(:content "..." :details (...) :error nil)~.
+The dispatcher serializes ~:content~ into the tool-result message.
+
+*** v1 built-in tools
+
+- ~epica-read-buffer~ :: ~(buffer &optional start end)~; defaults to
+  the narrowed region if active, else the whole buffer (with
+  truncation). Returns text + a buffer marker for follow-up edits.
+- ~epica-edit-region~ :: ~(buffer start-marker end-marker new-text)~;
+  applies the edit, pushes onto ~buffer-undo-list~, optionally renders
+  the change as an accept/reject overlay first.
+- ~epica-write-buffer~ :: create/overwrite a buffer and file.
+- ~epica-eshell-run~ :: run a command in a persistent eshell session
+  buffer; returns stdout/stderr/exit; keeps cwd/env across calls.
+
+*** Emacs-ecosystem tools (thin wrappers, enable as needed)
+
+- ~epica-xref-find-references~, ~epica-xref-find-definitions~
+- ~epica-project-search~ (wraps ~project-find-regexp~)
+- ~epica-dired~ ops
+- ~epica-diagnostics~ (flymake/eglot at point or buffer)
+- ~epica-magit~ (status, diff, commit)
+
+** Sessions as an org buffer
+
+#+begin_example
+* user
+:PROPERTIES:
+:EPICA_TS: 2025-...
+:END:
+Refactor the auth module.
+
+* assistant
+... response text ...
+** tool_call: read-buffer
+:PROPERTIES:
+:EPICA_TOOL: epica-read-buffer
+:EPICA_ARGS: (auth.el)
+:END:
+** tool_result
+#+begin_example
+... buffer contents ...
+#+end_example
+
+* user
+...
+#+end_example
+
+Advantages:
+- *Tree navigation* (~org-tree~) = pi's ~/tree~.
+- *Branching* = clone subtree = pi's ~/fork~/~clone~.
+- *Folding* of tool calls for readability.
+- *Compaction* = collapse a range of headings into a single summary
+  heading via an LLM call.
+- *Search/export* via normal Emacs.
+
+Storage: a plain ~.org~ file under ~epica-session-dir~ (default
+~~/.emacs.d/epica/sessions/~), named per project root like pi.
+
+** Hooks (the extension surface)
+
+Every decision point fires a hook. v1 hook list (grows as needed):
+
+- ~epica-session-start-hook~
+- ~epica-before-agent-start-hook~ (can inject message / mutate system prompt)
+- ~epica-turn-start-hook~ / ~epica-turn-end-hook~
+- ~epica-tool-call-hook~ (aborted-to-block: return ~(:block . "reason")~; can mutate args)
+- ~epica-tool-result-hook~ (can rewrite result)
+- ~epica-agent-settled-hook~
+- ~epica-session-shutdown-hook~
+
+Naming note: prefer the "aborted-to-block" convention Emacs uses
+(e.g. ~write-file-functions~) so handlers can veto by returning
+non-nil, rather than inventing a new return-value protocol.
+
+** Skills
+
+Identical to the [[https://agentskills.io][Agent Skills standard]] pi follows: read ~SKILL.md~ files
+from ~~/.emacs.d/epica/skills/~, ~~/.agents/skills/~, and project-local
+~~.agents/skills/~ (walking up to git root). Loaded on demand;
+injectable via ~epica-before-agent-start-hook~. This gives us
+ecosystem portability with pi skills out of the box.
+
+** Slash commands & UI
+
+- ~transient~ for command dispatch (~M-x epica~ or a key).
+- ~completing-read~ for model selection, session resume, etc.
+- Conversation buffer in ~org-mode~; tool calls foldable.
+- Editor: reuse the standard Emacs minibuffer or a dedicated prompt
+  buffer; ~C-return~ to send, queue steering/follow-up messages like pi.
+
+* Provider backend: gptel
+
+*Decision:* use [[https://github.com/karthink/gptel][gptel]] as the provider layer.
+
+*Provider selection (updated):* two SEPARATE paths, by design.
+
+- *Test harness:* `epica-default-backend` (test-only helper) picks
+  DeepSeek when `DEEPSEEK_API_KEY` is set (env / gitignored `.env` /
+  auth-source), else the local llama.cpp router. The local Qwen proved
+  too flaky at tool-calling (plan-only turns — see the step-8 nudge);
+  DeepSeek `deepseek-v4-flash` (tool + reasoning capable) is the test
+  backend. The `.env` mechanism is TEST-ONLY.
+- *Real integration:* users configure gptel normally (key handling,
+  `gptel-make-deepseek` in their init); with `epica-backend`/`epica-model`
+  nil, `epica-run` falls back to `gptel-backend`/`gptel-model`. No
+  epica-specific key storage exists — gptel's auth IS epica's auth.
+  `epica-max-tokens` only applies when `gptel-max-tokens` is unset.
+
+Rationale: HTTP/SSE/auth for 30+ providers churns constantly and is
+commodity plumbing. gptel already has the cleanest streaming +
+tool-call support in elisp. Our novelty is the *agentic loop* and the
+*buffer-native tools*, not yet another OpenAI client.
+
+Integration point: epica calls gptel to send the request and parse the
+stream; epica owns the turn loop, tool dispatch, session org buffer,
+and hooks. gptel is a library we depend on, not a UI we embed.
+
+*Open question (RESOLVED by the provider spike):* gptel's tool-use
+streaming fully meets the loop's needs — confirmed by a passing spike
+that streams tokens, executes a buffer-native tool, feeds the result
+back, and streams the final answer. See [[Build order]] step 1 findings.
+
+Detailed findings from the spike (all now baked into ~spike/spike.el~):
+
+- *Local-first dev unblocked.* The llama.cpp multi-model router is
+  OpenAI-compatible; ~gptel-make-openai~ targets it with ~:host
+  "host:port"~ + ~:protocol "http"~ and a dummy key. No paid key needed.
+- *Model-as-symbol.* ~gptel-model~ must be a /symbol/, not a string —
+  ~intern~ any model id.
+- *Pass ~:models~ for custom endpoints.* Otherwise gptel substitutes its
+  hardcoded OpenAI defaults (~gpt-5.4-mini~...) and the server returns
+  HTTP 400 "model not found". The spike discovers the router's model list
+  from ~/v1/models~ at startup so any local id (Qwen, gemma4, ...) is
+  accepted.
+- *Streaming terminal detection for tool loops.* gptel calls the
+  callback with ~t~ at the end of *each* HTTP request, not just the final
+  one. For a tool-calling flow the true terminal is a turn that produced
+  streaming text AND requested no tool call — naive ~t~-means-done exits
+  the loop one turn early, before the answer arrives.
+- *Reasoning models.* They emit ~(reasoning . chunk)~ and think for a
+  long time before acting. Budget time and timeouts (the spike allows
+  ~10 min). Model nondeterminism at ~temperature 0.6~ can make them
+  flail on exact argument values; reliability favors lower temperature
+  or a stronger tool-caller.
+- *Model choice matters.* Qwen3.6-35B-A3B has excellent tool-calling
+  and is fast (3B-active MoE). Gemma 4 E4B would not load in 6 minutes
+  and the Gemma family's tool-calling is historically weak — not
+  recommended for the agentic loop.
+
+*Step 2 findings (recorded as the loop landed in ~epica.el~):*
+
+- *~define-epica-tool~ shape.* ~(name args docstring &rest body)~,
+  each arg =(SYMBOL TYPE DOC [opts])=. Body returns a plist
+  =(:content <string> :details <any> :error <bool>)=. The macro
+  generates a positional-arg function (gptel applies tool args
+  *positionally*, not as a keyword plist) wrapped in
+  ~epica--call-with-hooks~.
+- *epica's hooks are NOT gptel's pre/post hooks.* ~gptel-request~
+  (the programmatic API) does not run
+  ~gptel-pre/post-tool-call-functions~ — those are exclusive to the
+  interactive ~gptel-send~ path. So ~epica-tool-call-hook~ and
+  ~epica-tool-result-hook~ fire from the tool wrapper instead.
+  (Bonus: this gives us pre-execution *block* for free.)
+- *Block contract is explicit, not "non-nil".* A hook blocks only by
+  returning a string or =(block . "reason")=. Any other return
+  observes. This avoids the footgun where an observe hook using ~push~
+  (which returns the new list) would silently block everything.
+- *Loop terminal detection.* gptel fires the callback with ~t~ per
+  HTTP request, not per conversation. Terminal for a tool loop = a
+  turn with streamed text and no tool call; settled via
+  ~epica-agent-settled-hook~.
+- *Be lenient on tool input.* Reasoning models pass slightly-off
+  argument values (e.g. =*epica-test= missing the closing star). A
+  good epica tool does exact-then-substring matching and never makes
+  the model flail on naming.
+- *Dev hygiene.* ~load-prefer-newer t~ in the test invocation so source
+  edits aren’t shadowed by a stale ~epica.elc~ (byte-compiling creates
+  it; ~require~ otherwise loads the old one).
+
+*Step 3 findings (buffer-native tools, in ~epica-tools.el~):*
+
+- *edit-region rides buffer-undo-list.* The headline win is real: each
+  find-and-replace pushes onto ~buffer-undo-list~, so the user undoes
+  agent edits with plain ~\[undo]~ — zero undo machinery to build.
+  Markers locate→apply so drift can’t break the edit.
+- *Uniqueness is required, and self-correcting.* old_text must match
+  exactly once; on miss or duplicate the tool returns guidance (buffer
+  head, or “appears twice”), and the model retries with more context.
+  This catches the classic “nam inside name” ambiguity.
+- *Lenient buffer names.* Reasoning models pass slightly-off names
+  (~*epica-test~ missing the star); ~epica--resolve-buffer~ does
+  exact-then-substring, and on failure lists live buffers. Essential
+  for reliability.
+- *shell-run uses make-comint, not eshell.* We planned “eshell”, but
+  eshell will not start a process under ~--batch~ (headless limitation),
+  and our whole test harness is batch. A persistent ~make-comint~ bash
+  process is stateful identically (cwd/env persist — verified), works
+  headless AND interactive, and was renamed ~shell-run~ to be honest.
+  elisp-via-eshell interop is deferred — the differentiator that
+  matters is /statefulness/, which we have.
+- *Sentinel-delimited shell capture.* Output is fenced with unique
+  ~__EPICA_START_/END_~ tags plus the exit code, so capture is clean
+  regardless of prompts or comint text properties.
+- *read-buffer honours narrowing.* If the buffer is narrowed, only the
+  narrowed region is returned — narrowing is the native “show the model
+  part of the buffer” mechanism, per design.org win #2.
+
+*Step 4 findings (org sessions, in ~epica.el~):*
+
+- *The session file IS the buffer.* No separate serialization: the
+  conversation buffer is a file-visiting org buffer
+  (~buffer-file-name~ → session org file), saved on settle and on kill.
+  Crash-safe via normal auto-save. This is the most Emacs-native
+  persistence possible.
+- *Resume = parse org → gptel conversation template.* ~gptel-request~'s
+  ~:system~ accepts ~(sys user1 llm1 user2 ...)~ as a conversation
+  template (~gptel--parse-directive~), so resuming is just: parse the
+  org headings back into an alternating list and pass it. History is
+  captured BEFORE rendering the new user turn so it isn't duplicated.
+- *Tool turns render as sub-headings* (~** tool-call~ / ~** tool-result~
+  with ~#+begin_example~ bodies), so the session file reads like a
+  reviewable transcript; folding hides tool noise. Resume skips
+  tool-only assistant sections (first line matches ~** tool-~).
+- *Reasoning is deliberately not rendered.* It's ephemeral thinking,
+  not conversation; rendering it would pollute the session file.
+- *Session namespacing gotcha.* ~expand-file-name~ ignores the base dir
+  when the second arg is absolute, so project roots must be relativized
+  (~file-relative-name root "/"~) before nesting under
+  ~epica-session-dir~ -- otherwise sessions land next to the project.
+- *Watch the backslash chain* when generating elisp regexes from
+  Python/heredocs: ~\\n~ in the writer becomes a literal ~\n~ in the
+  file, not a newline. Cost a debugging round.
+
+*Step 5 findings (hook surface, in ~epica.el~ + ~epica-ext-demo.el~):*
+
+- *Result hooks rewrite; call hooks block; both use explicit signals.*
+  A result hook rewrites only by returning a string (last wins; nil and
+  junk observe). A call hook blocks only by returning a string or
+  =(block . "reason")=. Nothing "non-nil" blocks/rewrites by accident —
+  the ~push~-returns-a-list footgun is designed out.
+- *~before-agent-start~ injects system prompts.* String returns are
+  collected (hook order) and appended to the system prompt for that
+  run — the documented "mutate system prompt" contract.
+- *The extension model needs no loader.* ~epica-ext-demo.el~ is a plain
+  Emacs file of ~add-hook~ calls: gate (blocks destructive shell),
+  redaction (~sk-*~/~TOPSECRET*~ scrubbed from tool results), and a
+  standing directive. It works through the live loop with zero plugin
+  machinery — exactly pi's "build it with an extension" philosophy,
+  native to Emacs.
+- *Headless extension testing works end-to-end.* The model genuinely
+  attempted ~rm -rf~ (uncensored Qwen) and was stopped by the gate; it
+  cat'd a secret file and could not repeat the token (redaction).
+  Deterministic hook contracts are tested directly via
+  ~epica--call-with-hooks~.
+- *Test gotcha:* advising ~cl-defun~s — the positional args shift the
+  plist, so ~(plist-get args :key)~ fails; use ~(cdr args)~.
+
+*Step 6 findings (branching + compaction, in ~epica.el~):*
+
+- *Branches are org containers, not a parallel store.* Forking archives
+  the abandoned tail into an ~* epica-branch: <ts>~ heading, demoted one
+  level so the session parser skips it; restoring promotes it back and
+  archives the current tail (a swap). Containers nest safely and survive
+  promote/demote cycles. The org file stays the single source of truth —
+  branching is just org structure.
+- *The parser must treat ANY level-1 heading as a section boundary.* The
+  step-4 regex parser (~^\* \(user\|assistant\)~) swallowed containers
+  into the previous assistant section once branches existed. Unifying on
+  ~epica--level1-sections~ (type-tagged sections with start/end) fixed
+  it — a latent bug that only surfaces with real branching.
+- *Compaction feeds the system prompt, not the history.* ~* epica-summary~
+  bodies are injected as "Previous conversation summary:" on resume, so
+  compacted context stays cheap and answerable. Verified: a fact in a
+  compacted turn was recalled exactly ("42").
+- *Compaction never crosses a branch container* — the region is clamped
+  at the first container, so archived branches are never destroyed.
+- *Dotted pairs bite.* Sections are ~(TYPE . (START . END))~; naive
+  accessors double-car. Use explicit ~epica--section-start/end~ helpers.
+
+*Step 7 findings (skills loader, in ~epica.el~ + ~epica-tools.el~):*
+
+- *Skills are ecosystem-portable by construction.* epica reads the same
+  ~SKILL.md~ files pi uses (~~/.agents/skills~). No conversion layer;
+  the Agent Skills standard IS the interface. Verified against the real
+  pi skills on this machine.
+- *The model discovers skills from the system prompt, loads them with a
+  tool.* The run appends "Available skills: name — description"; the
+  ~load-skill~ tool returns the full SKILL.md + file listing. Proven:
+  the model read "the sky is green in epicaland" from a loaded skill.
+- *Frontmatter parser handles folded (~>-~) descriptions* — real skills
+  use multiline descriptions; a naive single-line regex misses them.
+- *The backslash-chain bug struck again* — a single-~\\(~ in a regex
+  string silently matches literal parens (elisp deprecated escapes).
+  Cost a debug round; the lesson from step 4 keeps repeating.
+
+*Step 8 findings (interactive layer + the reliability fix):*
+
+- *Plan-only turns are a real failure mode of small reasoning models.*
+  The model frequently ends a turn with \"Let me read the buffer... then
+  fix\" and STOPS — no tool call. This flaked step 3 (2/5 passes) and
+  would flake any agentic task. Fixed at the loop level: an unfinished-
+  plan detector (plan-language + action-verb, no tool called that turn)
+  sends one gentle nudge turn, then continues; a second plan-only turn
+  settles (accept the plan as final) rather than stalling.
+- *The nudge once-per-run guard must settle when already nudged* — the
+  original version silently did nothing on the second plan-only turn,
+  stalling the loop until timeout. The edits had succeeded but the run
+  never settled.
+- *~transient~ and ~compat~ are built into the system Emacs* (30.2) —
+  do not install them into the project elpa; the spike-elpa copy lacked
+  compat and broke ~require~. The runner adds
+  ~/usr/share/emacs/30.2/lisp~ to load-path.
+- *~gptel-max-tokens~ matters for reasoning models* — the 4096 default
+  gets eaten by thinking, truncating the action; epica sends 16384.
+- The build is complete: all 8 steps pass together in one regression
+  run. Known flake class (model sampling) is mitigated by the nudge;
+  a retry-on-flake wrapper remains a nice-to-have for CI.
+- *Known flake:* model-based tests occasionally fail on a single run
+  (the reasoning model sometimes ignores a multi-step instruction).
+  Harness code is fine — rerun to confirm. Worth a retry-on-flake
+  wrapper for CI-style runs.
+- *A mid-script assert can silently drop earlier edits.* The Python
+  patch scripts abort before writing when any replacement assert fails —
+  two debugging rounds were lost edits, not lost logic. Write
+  incrementally; verify after each. in the test invocation so source
+  edits aren’t shadowed by a stale ~epica.elc~ (byte-compiling creates
+  it; ~require~ otherwise loads the old one).
+
+* The hard parts (risks)
+
+1. *Async + single thread.* The agent loop must be a non-blocking state
+   machine (timers + process filters), never blocking redisplay.
+   Streaming token rendering into the org buffer is the visible proof
+   it works.
+2. *No JSON Schema library.* We write a small ~define-epica-tool~ macro
+   (~50 lines) that turns a parameter spec into a JSON-Schema plist.
+   Not hard, but ours to own.
+3. *Token counting & prompt caching.* No elisp tokenizer; approximate
+   (chars/4) for v1. Anthropic ~cache_control~ breakpoints matter for
+   cost — manage them explicitly on the system prompt + stable context.
+4. *gptel tool-use fit.* Confirm gptel's streaming tool-call support
+   meets the loop's needs before building heavily on it.
+5. *Concurrency with user edits.* If the user edits a buffer the agent
+   is mid-edit-on, markers must track and overlays must not
+   conflict. Define a buffer-locking / ownership convention early.
+
+* What we reuse vs. build
+
+| Layer                     | Reuse                 | Build                                    |
+|---------------------------|-----------------------|------------------------------------------|
+| HTTP / SSE / auth         | gptel                 | —                                        |
+| Provider models           | gptel                 | —                                        |
+| Agent loop                | —                     | yes (state machine)                      |
+| Tool dispatch + schema    | —                     | yes (~define-epica-tool~)                |
+| Buffer-native tools       | —                     | yes (read/edit/write/eshell)             |
+| Code-intelligence tools   | xref, project, dired  | thin wrappers                            |
+| Session model             | org-mode              | the epica heading convention + compaction|
+| Extension surface         | Emacs hooks/advice    | the hook set                             |
+| Skills                    | Agent Skills standard | the loader                               |
+| Slash commands / UI       | transient, completing-read | the command set                    |
+
+* Build order
+
+1. *Provider spike.* ✅ DONE. gptel streaming + tool-use confirmed; the
+   loop runs fully on the local llama.cpp router with no API key. Exit
+   criterion met: tokens stream into a buffer and a tool call round-trips.
+   See ~spike/spike.el~ and the gptel section findings above.
+2. *~define-epica-tool~ + minimal loop.* ✅ DONE. ~define-epica-tool~
+   macro + the async agent loop + the hook surface are in ~epica.el~;
+   ~test-step2.el~ proves a model-defined tool runs through the loop
+   (call/result/settled hooks fire) and recovers a buffer secret. See
+   findings below.
+3. *Buffer-native tools.* ✅ DONE. ~epica-tools.el~ ships
+   ~read-buffer~, ~edit-region~ (free undo via buffer-undo-list),
+   ~write-buffer~, and ~shell-run~ (stateful persistent process).
+   Exit test: a two-bug multi-step edit on a live buffer succeeds,
+   with undo entries present. See findings below.
+4. *Org session buffer.* ✅ DONE. Sessions are file-visiting org
+   buffers: one heading per turn, `** tool-call'/'** tool-result'
+   sub-headings, saved on settle + on kill, resumed by parsing the org
+   back into gptel's conversation template. Exit test passes: a fact
+   planted in run 1 is recalled after close→reopen.
+5. *Hooks.* ✅ DONE. Every decision point is wired: call (block),
+   result (rewrite), before-agent-start (system-prompt injection),
+   turn start/end, agent-settled, session start/shutdown. ~epica-ext-demo.el~
+   proves the extension model: a destructive-command gate + secret
+   redaction, working through the live loop (model attempted ~rm -rf~,
+   was blocked; cat'd a secret, saw [REDACTED]).
+6. *Branching + compaction.* ✅ DONE. ~epica-fork~/~epica-restore-branch~
+   archive/restore abandoned tails as ~* epica-branch:~ org containers
+   (demote/promote, nest safely); ~epica-compact~ summarizes old turns
+   into an ~* epica-summary:~ heading whose body feeds the system prompt
+   on resume. Test: a fact planted in a compacted turn is still recalled;
+   fork→continue→restore swaps the active path correctly.
+7. *Skills loader.* ✅ DONE. Agent Skills standard (SKILL.md frontmatter
+   parser incl. folded descriptions); discovery from ~epica/skills~ +
+   ~~/.agents/skills~; a ~load-skill~ tool; the system prompt lists
+   available skills. The portability proof is stronger than planned:
+   pi's own skills in ~~/.agents/skills~ (code-review, skill-creator,
+   ...) are read verbatim with zero conversion, and the model
+   discovered + loaded a skill via the tool and answered from it.
+8. *Slash commands / transient UI.* ✅ DONE. ~epica-ui.el~: the
+   ~epica-menu~ transient prefix, ~M-x epica~, ~epica-send~ (minibuffer
+   prompt, answer streams into the session buffer), ~epica-minor-mode~
+   keybindings (C-c C-s/m/n/r/c), model selection, skill browsing.
+   All 8 steps now pass together (full regression suite green).
+
+* Open questions
+
+- [X] gptel tool-use streaming fit — RESOLVED by step 1.
+- [X] How tools dispatch through epica — RESOLVED by step 2:
+      `define-epica-tool` (positional args), hooks fire from the tool
+      wrapper (gptel-request doesn't run its pre/post hooks), explicit
+      block contract.
+- [ ] Buffer ownership/locking convention for concurrent user + agent edits.
+- [ ] Token-counting strategy: approximate vs. call-out; where to place
+      ~cache_control~ breakpoints.
+- [X] Conversation buffer format — RESOLVED by step 4: org-mode.
+      Buys folding, search, export, and a human-readable session file.
+- [ ] Do we support multiple concurrent agent turns across buffers, or
+      one active session at a time in v1?
+
+* References
+
+- [[https://github.com/karthink/gptel][gptel]] — provider/streaming/tool layer (to reuse).
+- [[https://github.com/ahyatt/llm][llm.el]] — thinner provider abstraction; fallback.
+- [[https://agentskills.io][Agent Skills standard]] — SKILL.md format (portable with pi).
+- pi's own docs (~pi-monorepo/README.md~, ~docs/sdk.md~,
+  ~docs/extensions.md~) — reference for the abstraction set being
+  adapted.
