@@ -20,16 +20,16 @@ repository. Pick the mechanism that matches your setup.
 
 ### use-package (recommended)
 
-Point `:load-path` at this checkout and load the pieces you want:
+Point `:load-path` at this checkout:
 
 ```elisp
 (use-package epica
   :load-path "~/src/epica/lisp"   ; <-- production code lives in lisp/
   :ensure gptel
-  :after gptel
-  :config
-  (require 'epica-tools)          ; the buffer-native tools
-  (require 'epica-ui))            ; M-x epica, the transient menu, minor mode
+  :after gptel)
+;; That's it. Requiring `epica' pulls in the buffer-native tools and the
+;; interactive UI (epica.el requires them after `provide'); `epica-menu'
+;; and the five tools are immediately available.
 
 ;; optional: the example extension (destructive-command gate + redaction)
 ;; (use-package epica-ext-demo
@@ -42,18 +42,14 @@ Point `:load-path` at this checkout and load the pieces you want:
 ```elisp
 (use-package epica
   :vc (:url "https://github.com/<you>/epica" :lisp-dir "lisp")
-  :after gptel
-  :config
-  (require 'epica-tools)
-  (require 'epica-ui))
+  :after gptel)
 ```
 
 `:lisp-dir "lisp"` is **required** — production code lives in `lisp/`
-and package-vc defaults to the repo root. (Verified end-to-end against
-this repo: install → `require 'epica` / `epica-tools` / `epica-ui` all
-load. Also note: only `lisp/epica.el` carries a `Package-Requires`
-header — sub-files must not, because package-vc merges headers from
-every `.el` and a self-reference breaks activation.)
+and package-vc defaults to the repo root. Requiring `epica` loads the
+whole agent (tools + UI). Also note: only `lisp/epica.el` carries a
+`Package-Requires` header — sub-files must not, because package-vc
+merges headers from every `.el` and a self-reference breaks activation.
 
 ### straight.el
 
@@ -61,10 +57,7 @@ every `.el` and a self-reference breaks activation.)
 (use-package epica
   :straight (epica :type git :host github :repo "<you>/epica"
                    :files ("lisp/*.el"))   ; production code lives in lisp/
-  :after gptel
-  :config
-  (require 'epica-tools)
-  (require 'epica-ui))
+  :after gptel)
 ```
 
 `:files ("lisp/*.el")` is **required** — straight's default recipe looks

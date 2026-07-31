@@ -2,7 +2,7 @@
 
 ;; Author: nsun
 ;; Version: 0.0.1
-;; Package-Requires: ((emacs "29.1") (gptel "0.9"))
+;; Package-Requires: ((emacs "29.1") (gptel "0.9") (transient "0.4"))
 ;; Keywords: ai tools convenience
 
 ;; This is the epica core: a minimal agent loop on top of gptel with
@@ -1099,5 +1099,16 @@ Real integration sets `epica-model' or relies on gptel's own model."
            epica-deepseek-model
          "HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:Q4_K_M"))))
 
+;;;###autoload
 (provide 'epica)
+
+;; Load the submodules AFTER `provide' so that `(require 'epica)'
+;; (and thus a single `use-package epica') pulls in the whole agent:
+;; the buffer-native tools and the interactive UI. Placed after provide
+;; to avoid a circular load (epica-tools requires epica). Loading the UI
+;; is inert (define-minor-mode / transient-define-prefix define things,
+;; they don't activate), so this stays safe in batch/embedded use.
+(require 'epica-tools)
+(require 'epica-ui)
+
 ;;; epica.el ends here
