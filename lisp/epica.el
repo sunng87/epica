@@ -73,6 +73,14 @@ Populated by `define-epica-tool' / `epica-register-tool'."
   :type 'function
   :group 'epica)
 
+(defcustom epica-visual-line t
+  "If non-nil, enable `visual-line-mode' in session buffers.
+Session buffers stream long lines of generated text; visual-line-mode
+word-wraps them instead of forcing horizontal scrolling. Set to nil to
+disable."
+  :type 'boolean
+  :group 'epica)
+
 (defcustom epica-sync-timeout 600
   "Seconds `epica-run-sync' pumps the event loop before giving up."
   :type 'integer
@@ -363,6 +371,7 @@ Interactively, switches to the new session buffer."
     (make-directory dir t)
     (with-current-buffer buf
       (funcall epica-conversation-major-mode)
+      (when epica-visual-line (visual-line-mode 1))
       (setq-local epica-session-file file)
       (setq-local buffer-file-name file)
       (setq-local buffer-save-without-query t)
@@ -379,6 +388,7 @@ Interactively, switches to the new session buffer."
   (let ((buf (find-file-noselect file)))
     (with-current-buffer buf
       (funcall epica-conversation-major-mode)
+      (when epica-visual-line (visual-line-mode 1))
       (setq-local epica-session-file file)
       (setq-local buffer-save-without-query t)
       (add-hook 'kill-buffer-hook #'epica--session-teardown nil t)

@@ -5,6 +5,10 @@
 *.pem
 authinfo*
 
+# --- personal local-testing init (not committed) ---
+/init.el
+/init.elc
+
 # --- build artifacts / vendored deps ---
 test/elpa/
 *.elc

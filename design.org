@@ -138,7 +138,7 @@ The dispatcher serializes ~:content~ into the tool-result message.
   applies the edit, pushes onto ~buffer-undo-list~, optionally renders
   the change as an accept/reject overlay first.
 - ~epica-write-buffer~ :: create/overwrite a buffer and file.
-- ~epica-eshell-run~ :: run a command in a persistent eshell session
+- ~epica-eshell-run~ :: run a command in this session's eshell
   buffer; returns stdout/stderr/exit; keeps cwd/env across calls.
 
 *** Emacs-ecosystem tools (thin wrappers, enable as needed)
@@ -320,16 +320,18 @@ Detailed findings from the spike (all now baked into ~test/spike/spike.el~):
   (~*epica-test~ missing the star); ~epica--resolve-buffer~ does
   exact-then-substring, and on failure lists live buffers. Essential
   for reliability.
-- *shell-run uses make-comint, not eshell.* We planned “eshell”, but
-  eshell will not start a process under ~--batch~ (headless limitation),
-  and our whole test harness is batch. A persistent ~make-comint~ bash
-  process is stateful identically (cwd/env persist — verified), works
-  headless AND interactive, and was renamed ~shell-run~ to be honest.
-  elisp-via-eshell interop is deferred — the differentiator that
-  matters is /statefulness/, which we have.
-- *Sentinel-delimited shell capture.* Output is fenced with unique
-  ~__EPICA_START_/END_~ tags plus the exit code, so capture is clean
-  regardless of prompts or comint text properties.
+- *eshell-run: the agent's shell IS Emacs' shell (updated).* Each epica
+  session owns an eshell buffer (state persists per session: ~cd~,
+  ~setenv~, aliases). Commands run through eshell's own evaluation —
+  every command or elisp expression returns a VALUE, plus its printed
+  output. Two paths: stateful ~eshell-send-input~ + pump-wait in
+  daemon/interactive Emacs; stateless ~eshell-command-result~ in a
+  clean temp buffer under ~--batch~ (eshell's process machinery is
+  unavailable there — external commands would be silently dropped).
+- *The make-comint bash backend is gone.* Its sentinel-delimited
+  capture worked, but it was a bash subprocess, not Emacs' shell — the
+  emacsclient-flailing symptom (the model trying to reach Emacs from
+  the shell) is exactly what the eshell backend eliminates.
 - *read-buffer honours narrowing.* If the buffer is narrowed, only the
   narrowed region is returned — narrowing is the native “show the model
   part of the buffer” mechanism, per design.org win #2.
@@ -501,7 +503,7 @@ Detailed findings from the spike (all now baked into ~test/spike/spike.el~):
    findings below.
 3. *Buffer-native tools.* ✅ DONE. ~epica-tools.el~ ships
    ~read-buffer~, ~edit-region~ (free undo via buffer-undo-list),
-   ~write-buffer~, and ~shell-run~ (stateful persistent process).
+   ~write-buffer~, and ~eshell-run~ (stateful per-session eshell).
    Exit test: a two-bug multi-step edit on a live buffer succeeds,
    with undo entries present. See findings below.
 4. *Org session buffer.* ✅ DONE. Sessions are file-visiting org

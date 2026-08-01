@@ -108,19 +108,19 @@ def compute(x, y)
         (message ">>> STEP 3 FAILED <<<"))
       (setq epica-test--exit-code (if pass 0 1))))
 
-  ;; --- light shell statefulness check (reported, not gate) ---
-  (message "\n--- shell statefulness check ---")
+  ;; --- light eshell-run check (reported, not gate) ---
+  ;; NOTE: batch uses the stateless eshell-command-result fallback;
+  ;; full statefulness (cd persists across calls) is verified in
+  ;; daemon/interactive mode. Here we verify value semantics.
+  (message "\n--- eshell-run check ---")
   (condition-case err
-      (let* ((r1 (epica--shell-send-and-capture "cd /tmp" 15))
-             (r2 (epica--shell-send-and-capture "pwd" 15))
-             (stateful (string-match-p "/tmp" (car r2))))
-        (message "  cd /tmp -> exit %d" (cdr r1))
-        (message "  pwd     -> %S (exit %d)" (car r2) (cdr r2))
-        (message "  stateful cwd preserved: %s" (if stateful "YES" "NO"))
-        (unless stateful
-          (message "  (shell statefulness not confirmed in this run; tool is delivered)")))
+      (let* ((r (epica--eshell-run "cd /tmp; pwd" 15)))
+        (message "  'cd /tmp; pwd' -> value=%S output=%S status=%S"
+                 (nth 0 r) (nth 1 r) (nth 2 r))
+        (message "  value semantics: %s"
+                 (if (string-match-p "/tmp" (or (nth 0 r) "")) "OK" "unexpected")))
     (error
-     (message "  shell check errored: %S (tool is delivered; headless shell)" err)))
+     (message "  eshell check errored: %S" err)))
 
   (kill-emacs epica-test--exit-code))
 

@@ -179,7 +179,7 @@ can extend the agent, and any Emacs user already knows how.
   packages that add hooks, not features baked into the core.
 
 - **Four buffer-native tools at the center:** `read-buffer`,
-  `edit-region`, `write-buffer`, `eshell-run`. Plus thin wrappers over
+  `edit-region`, `write-buffer`, `eeshell-run`. Plus thin wrappers over
   Emacs' code-intelligence commands, enabled as needed.
 
 ## How epica differs from other agents

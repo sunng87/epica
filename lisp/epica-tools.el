@@ -22,6 +22,7 @@
 (require 'epica)
 (require 'cl-lib)
 (require 'subr-x)
+(require 'eshell)   ; eshell-run backend; must load before binding eshell-buffer-name
 
 
 ;;; -------------------------------------------------- shared helpers ----
@@ -197,107 +198,155 @@ replacement where edit-region's find-and-replace is awkward."
                          :file file_path))))
 
 
-;;; -------------------------------------------------- shell-run --------
+;;; -------------------------------------------------- eshell-run --------
 
-;; A persistent shell process (bash via make-comint). cwd and env
-;; survive across calls -- the differentiator vs pi's stateless
-;; per-call bash. We use make-comint rather than a literal eshell
-;; session because make-comint works identically headless (batch, CI)
-;; and interactive; eshell's process will not start under --batch.
-;; elisp-via-eshell interop is a future option, not needed for v1.
+;; The agent's shell IS Emacs' shell. Each epica session owns an eshell
+;; buffer (buffer-local, named after the session), so cwd/env/state
+;; persist per session and never leak across sessions. Commands run
+;; through eshell's own evaluation: every command or elisp expression
+;; has a return VALUE plus whatever it printed.
+;;
+;; Two execution paths:
+;;  - process-backed (interactive/daemon Emacs): the session's eshell
+;;    has a live process; we send input, wait for the prompt, and read
+;;    the value and the printed output. Fully stateful.
+;;  - no-process fallback (batch): eshell cannot attach a persistent
+;;    process under --batch, so we evaluate with `eshell-command-result'
+;;    (same value semantics, but stateless across calls).
 
-(defcustom epica-shell-buffer-name "*epica-shell*"
-  "Name of epica's persistent shell process buffer."
-  :type 'string :group 'epica)
-
-(defcustom epica-shell-default-timeout 30
-  "Default seconds to wait for a shell command before giving up."
+(defcustom epica-eshell-default-timeout 30
+  "Default seconds to wait for an eshell command before giving up."
   :type 'integer :group 'epica)
 
-(defcustom epica-shell-program
-  (or (executable-find "bash") (getenv "SHELL") "/bin/sh")
-  "Shell program epica's persistent session runs.
-Defaults to bash (reliable flags across the board), not $SHELL."
-  :type 'string :group 'epica)
+(defvar-local epica--eshell-buffer nil
+  "Eshell buffer owned by the current epica session (nil until first use).")
 
-(defvar epica--shell-buffer nil
-  "Cached persistent shell buffer.")
+(defun epica--eshell-session-buffer ()
+  "Return (creating if needed) the eshell buffer for this session.
+The eshell buffer is named after the session buffer, so each session
+gets its own shell with its own state."
+  (or epica--eshell-buffer
+      (let ((name (format "*epica-eshell: %s*" (buffer-name))))
+        (unless (get-buffer name)
+          ;; (eshell t) creates the buffer and, interactively, its process
+          (let ((eshell-buffer-name name))
+            (save-window-excursion (eshell t))))
+        (setq-local epica--eshell-buffer (get-buffer name))
+        epica--eshell-buffer)))
 
-(defun epica--shell-session ()
-  "Return epica's persistent shell buffer, starting the process once.
-The buffer is created with `make-comint' so it works headless. Returns
-the buffer, or errors if the process cannot be started."
-  (if (and (buffer-live-p epica--shell-buffer)
-           (get-buffer-process epica--shell-buffer))
-      epica--shell-buffer
-    (let ((buf (make-comint "epica-shell" epica-shell-program nil)))
-      (setq epica--shell-buffer buf)
-      (let ((proc (get-buffer-process buf))
-            (deadline (+ (float-time) 3)))
-        (while (and proc (memq (process-status proc) '(open run))
-                    (< (float-time) deadline))
-          (accept-process-output proc 0.1)))
-      (or (get-buffer-process buf)
-          (error "epica: could not start persistent shell (%s)" epica-shell-program))
-      buf)))
+(defun epica--eshell-wait-idle (baseline timeout)
+  "Pump until eshell output is stable and no process is running.
+BASELINE is the buffer size BEFORE the command was sent (so commands
+that finish synchronously are detected). Returns non-nil if the command
+finished; nil on timeout."
+  (let ((deadline (+ (float-time) (or timeout epica-eshell-default-timeout)))
+        (prev baseline) (stable 0) (started nil) finished)
+    (while (and (not finished) (< (float-time) deadline))
+      (accept-process-output nil 0.1)
+      (let ((size (point-max)))
+        (cond
+         ((> size prev)
+          (setq started t stable 0))       ; output still arriving
+         ((and started (not (eshell-head-process)))
+          (setq stable (1+ stable))
+          (when (>= stable 3) (setq finished t)))  ; 0.3s of quiet
+         (t (setq stable 0))))
+      (setq prev (point-max)))
+    finished))
 
-(defun epica--shell-send-and-capture (command timeout)
-  "Run COMMAND in the persistent shell; return (OUTPUT . EXIT-CODE).
-Sentinel-delimited capture for clean output and a recoverable exit code.
-TIMEOUT bounds the wait in seconds."
-  (let* ((buf (epica--shell-session))
-         (proc (get-buffer-process buf))
-         (id (format "%06d" (random 1000000)))
-         (start-tag (format "__EPICA_START_%s__" id))
-         (end-tag (format "__EPICA_END_%s__" id))
-         (deadline (+ (float-time) (or timeout epica-shell-default-timeout)))
-         output exit-code)
+(defun epica--eshell-run-live (command timeout)
+  "Stateful eshell execution in this session's eshell buffer.
+Sends COMMAND via `eshell-send-input' and pumps until the output
+settles; returns (VALUE OUTPUT STATUS). State (cwd, env) persists in
+the eshell buffer across calls."
+  (let* ((buf (epica--eshell-session-buffer))
+         (sentinel (make-symbol "epica--unset"))
+         value output status)
     (with-current-buffer buf
-      (let ((scan-from (point-max)))
+      (let ((output-start (point-max)))
         (goto-char (point-max))
-        (process-send-string
-         proc
-         (format "echo %s; %s; echo %s$?\n" start-tag command end-tag))
-        (while (and (process-live-p proc)
-                    (progn (goto-char scan-from)
-                           (not (re-search-forward
-                                 (concat (regexp-quote end-tag) "\\([0-9]+\\)")
-                                 nil t)))
-                    (< (float-time) deadline))
-          (accept-process-output proc 0.1))
-        (goto-char scan-from)
-        (if (re-search-forward
-             (concat (regexp-quote start-tag) "\n\\(\\(?:.\\|\n\\)*?\\)"
-                     (regexp-quote end-tag) "\\([0-9]+\\)")
-             nil t)
-            (setq output (match-string 1)
-                  exit-code (string-to-number (match-string 2)))
-          (setq output (buffer-substring-no-properties scan-from (point-max))
-                exit-code -1))))
-    (cons (or output "") (or exit-code -1))))
+        (insert command)
+        (setq-local eshell-last-command-result sentinel)
+        (let ((baseline (point-max)))
+          (eshell-send-input)
+          (if (not (epica--eshell-wait-idle baseline timeout))
+            (setq status -1
+                  value (if (eq eshell-last-command-result sentinel)
+                            "(timeout)"
+                          (let ((r eshell-last-command-result))
+                            (if (stringp r)
+                                (substring-no-properties r)
+                              (prin1-to-string r))))
+                  output (buffer-substring-no-properties
+                          (progn (goto-char output-start) (forward-line 1) (point))
+                          (point-max)))
+          (setq status eshell-last-command-status
+                value (if (eq eshell-last-command-result sentinel)
+                          "nil"
+                        (let ((r eshell-last-command-result))
+                          (if (stringp r)
+                              (substring-no-properties r)
+                            (prin1-to-string r))))
+                output
+                (string-trim
+                 (buffer-substring-no-properties
+                  (progn (goto-char output-start)
+                         (forward-line 1)   ; skip the command echo
+                         (point))
+                  (or (progn (goto-char (point-max))
+                             (re-search-backward eshell-prompt-regexp nil t)
+                             (match-beginning 0))
+                      (point-max)))))))))
+    (list value output status)))
 
-(define-epica-tool shell-run
-  ((command string "Shell command to run.")
+(defun epica--eshell-run-batch (command)
+  "Stateless eshell evaluation for batch mode (eshell cannot run
+external commands via send-input without the interactive process
+machinery). Evaluates in a clean temp eshell buffer via
+`eshell-command-result', which returns command values correctly."
+  (with-temp-buffer
+    (eshell-mode)
+    (let ((result (eshell-command-result command)))
+      (list (if (stringp result) result (prin1-to-string result))
+            (if (stringp result) result (prin1-to-string result))
+            eshell-last-command-status))))
+
+(defun epica--eshell-run (command timeout)
+  "Run COMMAND in this session's eshell; return (VALUE OUTPUT STATUS).
+Uses the stateful `eshell-send-input' path in daemon/interactive Emacs;
+falls back to stateless `eshell-command-result' under `noninteractive'
+(batch), where eshell lacks the process machinery."
+  (if noninteractive
+      (epica--eshell-run-batch command)
+    (epica--eshell-run-live command timeout)))
+
+(define-epica-tool eshell-run
+  ((command string "Shell command or Emacs Lisp expression to run in this session's eshell.")
    (timeout integer "Seconds to wait for completion (default 30)." :optional t))
-  "Run COMMAND in epica's persistent shell session.
+  "Run COMMAND in this epica session's persistent eshell.
 
-State is preserved across calls: working directory (cd), environment
-variables (export), and shell functions all survive from one call to the
-next -- unlike tools that spawn a fresh shell each time. Output
-(stdout+stderr) and the exit code are returned. If the command does not
-finish within TIMEOUT seconds, partial output is returned with exit
-code -1."
+This is Emacs' own shell: COMMAND may be a shell command or an Emacs
+Lisp expression, and every command returns a VALUE -- elisp expressions
+return their value, external commands return their output. State
+persists per session: cd, setenv/export, and aliases survive across
+calls. Returns the return value, the printed output, and the exit
+status."
   (condition-case err
-      (let* ((wait (if (and (integerp timeout) (> timeout 0))
-                       timeout epica-shell-default-timeout))
-             (res (epica--shell-send-and-capture command wait))
-             (out (car res))
-             (code (cdr res)))
+      (let* ((res (epica--eshell-run command timeout))
+             (value (nth 0 res))
+             (output (nth 1 res))
+             (status (nth 2 res)))
         (list :content
-              (format "[exit %d]\n%s" code (or out ""))
-              :details (list :exit code :command command)))
+              (string-join
+               (delq nil
+                     (list (format "[exit %s]" (or status "?"))
+                           (format "value: %s" (or value "(nil)"))
+                           (and output (not (string-empty-p output))
+                                (unless (equal output value) output))))
+               "\n")
+              :details (list :value value :output output :status status)))
     (error
-     (list :content (format "shell error: %S" err) :error t))))
+     (list :content (format "eshell error: %S" err) :error t))))
 
 
 ;;; -------------------------------------------------- skills -----------

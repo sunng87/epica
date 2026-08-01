@@ -27,7 +27,7 @@
   '("\\brm\\b" "\\bsudo\\b" "\\bmkfs\\b" "\\bshred\\b"
     "\\bunlink\\b" "\\brmdir\\b" "\\btruncate\\b"
     "\\bfind\\b.*\\b-delete\\b" "\\bdd if=")
-  "Regexes that mark a shell-run command as destructive."
+  "Regexes that mark an eshell-run command as destructive."
   :type '(repeat regexp) :group 'epica)
 
 (defcustom epica-ext-secret-patterns
@@ -36,9 +36,9 @@
   :type '(repeat regexp) :group 'epica)
 
 (defun epica-ext--gate-shell (info)
-  "Block destructive commands in the shell-run tool.
+  "Block destructive commands in the eshell-run tool.
 Returns (block . REASON) when the command matches a destructive pattern."
-  (when (equal (plist-get info :name) "shell-run")
+  (when (equal (plist-get info :name) "eshell-run")
     (let ((cmd (plist-get (plist-get info :args) :command)))
       (when (and (stringp cmd)
                  (seq-some (lambda (re) (string-match-p re cmd))
