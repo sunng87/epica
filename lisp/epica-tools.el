@@ -187,7 +187,17 @@ replacement where edit-region's find-and-replace is awkward."
         (erase-buffer)
         (insert content)
         (when (and file_path (stringp file_path) (not (string-empty-p file_path)))
-          (write-region (point-min) (point-max) file_path))))
+          (write-region (point-min) (point-max) file_path)
+          ;; If this buffer VISITS the file we just wrote, sync the
+          ;; recorded modtime and clear the modified flag. A bare
+          ;; write-region leaves both stale, so the next save-buffer
+          ;; would prompt "file changed on disk" even though the file
+          ;; content matches the buffer exactly.
+          (when (and buffer-file-name
+                     (file-equal-p (file-truename buffer-file-name)
+                                   (file-truename file_path)))
+            (set-visited-file-modtime)
+            (set-buffer-modified-p nil)))))
     (list :content
           (format "Wrote %d chars to buffer %s%s"
                   (length content) buffer
