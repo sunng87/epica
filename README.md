@@ -29,7 +29,7 @@ Point `:load-path` at this checkout:
   :after gptel)
 ;; That's it. Requiring `epica' pulls in the buffer-native tools and the
 ;; interactive UI (epica.el requires them after `provide'); `epica-menu'
-;; and the five tools are immediately available.
+;; and all six tools are immediately available.
 
 ;; optional: the example extension (destructive-command gate + redaction)
 ;; (use-package epica-ext-demo
@@ -178,9 +178,11 @@ can extend the agent, and any Emacs user already knows how.
   git-checkpointing, plan mode, sub-agents — all are ordinary Emacs
   packages that add hooks, not features baked into the core.
 
-- **Four buffer-native tools at the center:** `read-buffer`,
-  `edit-region`, `write-buffer`, `eeshell-run`. Plus thin wrappers over
-  Emacs' code-intelligence commands, enabled as needed.
+- **Six tools at the center:** `read-buffer`, `edit-region`,
+  `write-buffer`, `eshell-run` (the agent's shell IS Emacs' shell),
+  `load-skill`, and `webfetch` (url.el + shr — no curl, no subprocess).
+  Plus thin wrappers over Emacs' code-intelligence commands, enabled as
+  needed.
 
 ## How epica differs from other agents
 

@@ -372,5 +372,101 @@ improvising. Skills follow the cross-ecosystem Agent Skills standard, so
 they work identically in epica, pi, and other harnesses."
   (epica-skill-load name))
 
+
+;;; -------------------------------------------------- webfetch --------
+
+;; Fetching URLs the Emacs way: url.el (built-in HTTP/TLS/redirect/
+;; proxy machinery — no curl, no subprocess) + shr (built-in HTML
+;; renderer) for readable text. Same network stack Emacs itself uses.
+
+(defcustom epica-webfetch-max-chars 8000
+  "Default maximum characters the webfetch tool returns."
+  :type 'integer :group 'epica)
+
+(defcustom epica-webfetch-timeout 20
+  "Seconds to wait for a webfetch before giving up."
+  :type 'integer :group 'epica)
+
+(defun epica--webfetch-text (buffer)
+  "Extract readable text from an HTTP response BUFFER.
+Returns (CONTENT-TYPE . TEXT). HTML is rendered to text via shr;
+binary types are reported, not dumped."
+  (with-current-buffer buffer
+    (goto-char (point-min))
+    (let* ((header-end (if (search-forward "\n\n" nil t) (point) (point-min)))
+           (content-type (save-excursion
+                           (goto-char (point-min))
+                           (when (re-search-forward
+                                  "^Content-Type: *\\([^;\r\n]+\\)" nil t)
+                             (downcase (string-trim (match-string 1))))))
+           (raw (buffer-substring-no-properties header-end (point-max))))
+      (cond
+       ((and content-type (string-match-p "html" content-type))
+        (cons content-type
+              (condition-case err
+                  (with-temp-buffer
+                    (require 'shr)
+                    (shr-insert-document
+                     (with-temp-buffer
+                       (insert raw)
+                       (libxml-parse-html-region (point-min) (point-max))))
+                    (buffer-string))
+                (error (format "(html rendering failed: %S)" err)))))
+       ;; binary sniff: NUL bytes = binary regardless of content-type
+       ;; (file:// text files come through as octet-stream, so the
+       ;; content-type alone would misclassify them)
+       ((string-match-p (string ?\0) raw)
+        (cons content-type
+              (format "[binary content: %d bytes, type %s — not shown]"
+                      (length raw) content-type)))
+       (t (cons content-type raw))))))
+
+(defun epica--webfetch (url max-chars timeout)
+  "Fetch URL; return (TEXT STATUS CONTENT-TYPE).
+Uses `url-retrieve-synchronously' with a timeout; HTML is rendered to
+text. On failure TEXT explains the error."
+  (let ((url-request-extra-headers
+         (cons '("User-Agent" . "epica/0.1 (Emacs-native agent)")
+               url-request-extra-headers)))
+    (condition-case err
+        (let ((buf (url-retrieve-synchronously
+                    url t nil (or timeout epica-webfetch-timeout))))
+          (if (null buf)
+              (list (format "fetch failed (error or timeout after %s s)"
+                            (or timeout epica-webfetch-timeout))
+                    "failed" nil)
+            (unwind-protect
+                (with-current-buffer buf
+                  (goto-char (point-min))
+                  (let* ((status (if (re-search-forward
+                                      "^HTTP/1\\.[01] \\([0-9]+\\)" nil t)
+                                     (match-string 1) "?"))
+                         (text (epica--webfetch-text buf))
+                         (content (substring-no-properties (cdr text))))
+                    (list (substring content 0
+                                     (min (or max-chars epica-webfetch-max-chars)
+                                          (length content)))
+                          status (car text))))
+              (kill-buffer buf))))
+      (error (list (format "fetch error: %S" err) "error" nil)))))
+
+(define-epica-tool webfetch
+  ((url string "The URL to fetch (http://, https://, or file://).")
+   (max_chars integer "Maximum characters of text to return (default 8000)." :optional t))
+  "Fetch a URL and return its readable text content.
+
+Emacs-native: uses url.el — the same HTTP/TLS/redirect/proxy stack
+Emacs itself uses. No curl, no subprocess. HTML pages are rendered to
+readable text via shr; binary content (images, PDFs, archives) is
+reported with its type and size, not dumped. Use this to read
+documentation, APIs, or web pages instead of shelling out to curl."
+  (let* ((res (epica--webfetch url max_chars nil))
+         (text (nth 0 res)) (status (nth 1 res)) (ct (nth 2 res)))
+    (list :content
+          (format "[%s] (%s, %d chars)\n%s"
+                  (or status "?") (or ct "unknown") (length text) text)
+          :details (list :url url :status status :content-type ct
+                         :chars (length text)))))
+
 (provide 'epica-tools)
 ;;; epica-tools.el ends here

@@ -41,6 +41,11 @@ def compute(x, y)
 
 ;;; --- instrumentation ---
 
+(defvar t3-ok t)
+(defun t3-assert (cond label)
+  (message "  [%s] %s" (if cond "ok" "FAIL") label)
+  (unless cond (setq t3-ok nil)))
+
 (defvar epica-test--calls nil)
 (defvar epica-test--results nil)
 (defvar epica-test--settled nil)
@@ -107,6 +112,17 @@ def compute(x, y)
           (message ">>> STEP 3 PASSED: multi-step live-buffer edit succeeded, undo available <<<")
         (message ">>> STEP 3 FAILED <<<"))
       (setq epica-test--exit-code (if pass 0 1))))
+
+  ;; --- webfetch check (hermetic via file://) ---
+  (message "\n--- webfetch check ---")
+  (let* ((rf (expand-file-name "README.md" (file-name-directory
+                                            (file-truename load-file-name)))))
+    (let ((r (epica--webfetch (concat "file://" rf) 500 nil)))
+      (t3-assert (string-match-p "epica" (or (nth 0 r) ""))
+                 "webfetch reads a text file via file://"))
+    (let ((r (epica--webfetch "file:///bin/ls" 100 nil)))
+      (t3-assert (string-match-p "binary content" (or (nth 0 r) ""))
+                 "webfetch reports binary, does not dump it")))
 
   ;; --- light eshell-run check (reported, not gate) ---
   ;; NOTE: batch uses the stateless eshell-command-result fallback;
