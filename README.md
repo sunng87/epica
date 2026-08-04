@@ -39,9 +39,10 @@ sub-files must not (package-vc merges headers; a self-reference breaks
 activation).
 
 After install: configure gptel first (see Providers), then `M-x epica`.
-`C-c C-s` opens a prompt-drafting buffer (magit-commit style: write
-your prompt, `C-c C-c` sends, `C-c C-k` cancels). Optionally enable
-session keybindings via epica's own hook surface:
+`C-c C-s` (or `C-c C-p`) opens a prompt-drafting buffer (magit-commit
+style: write your prompt, `C-c C-c` sends, `C-c C-k` cancels, and the
+window closes on send). Optionally enable session keybindings via
+epica's own hook surface:
 
 ```elisp
 (add-hook 'epica-session-start-hook (lambda () (epica-minor-mode 1)))

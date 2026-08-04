@@ -99,22 +99,29 @@ shown afterwards so the answer streams in view."
       (setq-local epica-prompt--session-buffer session)
       (erase-buffer))
     (when (called-interactively-p 'any)
-      (pop-to-buffer buf))
+      ;; dedicated window: sending/cancelling can then close it cleanly
+      (pop-to-buffer buf '(display-buffer-pop-up-window (dedicated . t))))
     buf))
 
 (defun epica-prompt-send ()
-  "Send the draft prompt to the agent and close the prompt buffer."
+  "Send the draft prompt to the agent and close the prompt window."
   (interactive)
-  (let ((prompt (string-trim (buffer-string))))
+  (let ((prompt (string-trim (buffer-string)))
+        (win (get-buffer-window)))
     (when (string-empty-p prompt)
       (user-error "Empty prompt — nothing to send"))
     (kill-buffer)
+    (when (window-live-p win)
+      (quit-window nil win))
     (epica-send prompt)))
 
 (defun epica-prompt-cancel ()
-  "Cancel the draft prompt without sending."
+  "Cancel the draft prompt without sending; close the prompt window."
   (interactive)
-  (kill-buffer))
+  (let ((win (get-buffer-window)))
+    (kill-buffer)
+    (when (window-live-p win)
+      (quit-window nil win))))
 
 ;;; -------------------------------------------------- minor mode --------
 
@@ -123,6 +130,7 @@ shown afterwards so the answer streams in view."
 
 \\<epica-minor-mode-map>
 \\[epica-send]             send a prompt to the agent
+\\[epica-compose]          open the prompt-drafting buffer
 \\[epica-menu]             open the epica menu
 \\[epica-new-session]      start a new session
 \\[epica-resume]           resume a saved session
@@ -130,6 +138,7 @@ shown afterwards so the answer streams in view."
   :lighter " epica"
   :keymap (let ((map (make-sparse-keymap)))
             (define-key map (kbd "C-c C-s") #'epica-send)
+            (define-key map (kbd "C-c C-p") #'epica-compose)
             (define-key map (kbd "C-c C-m") #'epica-menu)
             (define-key map (kbd "C-c C-n") #'epica-new-session)
             (define-key map (kbd "C-c C-r") #'epica-resume)
@@ -149,7 +158,7 @@ shown afterwards so the answer streams in view."
     ("m" "Select model" epica-select-model)
     ("s" "View skill" epica-view-skill)]]
   [["Actions"
-    ("p" "Send prompt" epica-send)]])
+    ("p" "Compose prompt" epica-compose)]])
 
 (provide 'epica-ui)
 ;;; epica-ui.el ends here
