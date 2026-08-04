@@ -23,12 +23,16 @@ The agent runs in the session buffer; type C-c C-s (in
 
 (defun epica-send (prompt)
   "Send PROMPT to the agent in the active session buffer (async).
-The answer streams into the session buffer as it is generated."
-  (interactive "sepica prompt: ")
-  (let ((buf (epica--conv-buffer t)))
-    (pop-to-buffer buf)
-    (epica-run prompt :buffer buf)
-    (message "epica: agent started in %s" (buffer-name buf))))
+The answer streams into the session buffer as it is generated.
+Interactively (PROMPT nil), opens the prompt buffer to draft a
+multi-line prompt instead of reading the minibuffer."
+  (interactive)
+  (if (null prompt)
+      (epica-compose)
+    (let ((buf (epica--conv-buffer t)))
+      (pop-to-buffer buf)
+      (epica-run prompt :buffer buf)
+      (message "epica: agent started in %s" (buffer-name buf)))))
 
 (defun epica-select-model (&optional model)
   "Choose the model for epica runs.
@@ -58,6 +62,59 @@ With MODEL (a string), set it directly."
   "Compact the current session's oldest turns (interactive wrapper)."
   (interactive)
   (epica-compact 4))
+
+;;; -------------------------------------------------- prompt buffer ------
+
+;; Draft prompts in a dedicated buffer, magit-commit style: write a
+;; multi-line prompt, C-c C-c to send, C-c C-k to cancel.
+
+(defcustom epica-prompt-buffer-name "*epica-prompt*"
+  "Name of the buffer used to draft prompts."
+  :type 'string :group 'epica)
+
+(defvar-local epica-prompt--session-buffer nil
+  "Session buffer the draft prompt will be sent to.")
+
+(define-derived-mode epica-prompt-mode text-mode "epica-prompt"
+  "Major mode for drafting epica prompts.
+
+Write a multi-line prompt, then send it with \[epica-prompt-send]
+(C-c C-c) or cancel with \[epica-prompt-cancel] (C-c C-k)."
+  (setq-local header-line-format
+              "epica prompt: C-c C-c send · C-c C-k cancel"))
+
+(define-key epica-prompt-mode-map (kbd "C-c C-c") #'epica-prompt-send)
+(define-key epica-prompt-mode-map (kbd "C-c C-k") #'epica-prompt-cancel)
+
+(defun epica-compose ()
+  "Open a buffer to draft a prompt for the agent (C-c C-c sends).
+The prompt is sent to the active epica session; the session buffer is
+shown afterwards so the answer streams in view."
+  (interactive)
+  (let* ((session (epica--conv-buffer t))
+         (buf (get-buffer-create epica-prompt-buffer-name)))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'epica-prompt-mode)
+        (epica-prompt-mode))
+      (setq-local epica-prompt--session-buffer session)
+      (erase-buffer))
+    (when (called-interactively-p 'any)
+      (pop-to-buffer buf))
+    buf))
+
+(defun epica-prompt-send ()
+  "Send the draft prompt to the agent and close the prompt buffer."
+  (interactive)
+  (let ((prompt (string-trim (buffer-string))))
+    (when (string-empty-p prompt)
+      (user-error "Empty prompt — nothing to send"))
+    (kill-buffer)
+    (epica-send prompt)))
+
+(defun epica-prompt-cancel ()
+  "Cancel the draft prompt without sending."
+  (interactive)
+  (kill-buffer))
 
 ;;; -------------------------------------------------- minor mode --------
 

@@ -93,9 +93,57 @@ The ui-demo skill says: everything works.
              "epica main entry leaves a live buffer"))
 
 
-;;; ---------- part B: send drives a real agent turn ----------
+;;; ---------- part B: prompt-drafting buffer (magit-commit style) ----------
 
-(message "\n--- part B: epica-send end-to-end ---")
+(message "\n--- part B: prompt buffer ---")
+
+;; compose opens a dedicated prompt buffer in prompt mode, keybindings bound
+(let ((buf (epica-compose)))
+  (t8-assert (with-current-buffer buf (derived-mode-p 'epica-prompt-mode))
+             "epica-compose opens a prompt buffer in epica-prompt-mode")
+  (t8-assert (eq (lookup-key epica-prompt-mode-map (kbd "C-c C-c"))
+                 #'epica-prompt-send)
+             "C-c C-c binds epica-prompt-send")
+  (t8-assert (eq (lookup-key epica-prompt-mode-map (kbd "C-c C-k"))
+                 #'epica-prompt-cancel)
+             "C-c C-k binds epica-prompt-cancel")
+  (kill-buffer buf))
+
+;; empty prompt refused
+(let ((buf (epica-compose)))
+  (set-buffer buf)
+  (condition-case e
+      (epica-prompt-send)
+    (user-error (t8-assert t "empty prompt refused with user-error")))
+  (t8-assert (buffer-live-p buf) "prompt buffer survives an empty send")
+  (kill-buffer buf))
+
+;; cancel kills without sending
+(let ((buf (epica-compose)))
+  (with-current-buffer buf (insert "draft"))
+  (set-buffer buf)
+  (epica-prompt-cancel)
+  (t8-assert (not (buffer-live-p buf)) "C-c C-k cancels the draft"))
+
+;; send closes the buffer and drives a real agent turn
+(let ((buf (epica-compose))
+      (session (epica--conv-buffer)))
+  (with-current-buffer buf (insert "Reply with exactly the word PONG."))
+  (set-buffer buf)
+  (epica-prompt-send)
+  (t8-assert (not (buffer-live-p buf)) "send closes the prompt buffer")
+  (let ((deadline (+ (float-time) 300)))
+    (with-current-buffer session
+      (while (and (not epica--settled) (< (float-time) deadline))
+        (accept-process-output nil 0.2))))
+  (t8-assert (with-current-buffer session
+               (string-match-p "PONG" (buffer-string)))
+             "prompt-buffer send drives a real agent turn")
+  (kill-buffer session))
+
+;;; ---------- part C: send drives a real agent turn ----------
+
+(message "\n--- part C: epica-send end-to-end ---")
 
 (let ((buf (epica-new-session "ui-e2e")))
   (epica-send "Reply with exactly the word PING.")
