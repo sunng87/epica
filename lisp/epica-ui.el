@@ -22,6 +22,7 @@
 
 ;;; -------------------------------------------------- commands ----------
 
+;;;###autoload
 (defun epica ()
   "Start (or resume) the active epica session and show it.
 The agent runs in the session buffer; type C-c C-s (in
@@ -31,6 +32,7 @@ The agent runs in the session buffer; type C-c C-s (in
     (switch-to-buffer buf)
     (message "epica: C-c C-s to send a prompt, C-c C-m for the menu")))
 
+;;;###autoload
 (defun epica-send (prompt)
   "Send PROMPT to the agent in the active session buffer (async).
 The answer streams into the session buffer as it is generated.
@@ -44,6 +46,7 @@ multi-line prompt instead of reading the minibuffer."
       (epica-run prompt :buffer buf)
       (message "epica: agent started in %s" (buffer-name buf)))))
 
+;;;###autoload
 (defun epica-select-model (&optional model)
   "Choose the model for epica runs.
 Interactively, completing-read over the backend's model list.
@@ -58,6 +61,7 @@ With MODEL (a string), set it directly."
     (setq epica-model (intern choice))
     (message "epica model: %s" choice)))
 
+;;;###autoload
 (defun epica-view-skill (name)
   "Display skill NAME's SKILL.md (and file list) in a help buffer."
   (interactive (list (completing-read
@@ -68,6 +72,7 @@ With MODEL (a string), set it directly."
       (with-output-to-temp-buffer "*epica-skill*"
         (princ (epica-skill-load name))))))
 
+;;;###autoload
 (defun epica-compact-session ()
   "Compact the current session's oldest turns (interactive wrapper)."
   (interactive)
@@ -96,6 +101,7 @@ Write a multi-line prompt, then send it with \[epica-prompt-send]
 (define-key epica-prompt-mode-map (kbd "C-c C-c") #'epica-prompt-send)
 (define-key epica-prompt-mode-map (kbd "C-c C-k") #'epica-prompt-cancel)
 
+;;;###autoload
 (defun epica-compose ()
   "Open a buffer to draft a prompt for the agent (C-c C-c sends).
 The prompt is sent to the active epica session; the session buffer is
@@ -135,6 +141,7 @@ shown afterwards so the answer streams in view."
 
 ;;; -------------------------------------------------- minor mode --------
 
+;;;###autoload
 (define-minor-mode epica-minor-mode
   "Minor mode with epica keybindings for session buffers.
 
@@ -157,6 +164,7 @@ shown afterwards so the answer streams in view."
 
 ;;; -------------------------------------------------- transient menu ----
 
+;;;###autoload
 (transient-define-prefix epica-menu ()
   "epica: interactive agent menu."
   [["Session"

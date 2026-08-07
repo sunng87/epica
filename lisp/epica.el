@@ -145,6 +145,7 @@ return nil never accidentally rewrites."
 
 ;;; -------------------------------------------------- tool registry ----
 
+;;;###autoload
 (defun epica-register-tool (tool)
   "Register gptel-tool TOOL in `epica-tools' (replacing any same-named)."
   (let ((name (gptel-tool-name tool)))
@@ -160,10 +161,12 @@ return nil never accidentally rewrites."
         (cl-remove-if (lambda (tool) (equal (gptel-tool-name tool) name))
                       epica-tools)))
 
+;;;###autoload
 (defun epica-get-tool (name)
   "Return the registered gptel-tool named NAME (string), or nil."
   (cl-find-if (lambda (tool) (equal (gptel-tool-name tool) name)) epica-tools))
 
+;;;###autoload
 (defun epica-tool-names ()
   "Return the list of registered tool names (strings)."
   (mapcar #'gptel-tool-name epica-tools))
@@ -171,6 +174,7 @@ return nil never accidentally rewrites."
 
 ;;; -------------------------------------------------- define-epica-tool
 
+;;;###autoload
 (defmacro define-epica-tool (name args docstring &rest body)
   "Define an epica tool named NAME (a symbol).
 
@@ -340,6 +344,7 @@ Uses project.el when a project is known, else `default-directory'."
         (file-name-as-directory (directory-file-name (project-root pr))))
       (file-name-as-directory (expand-file-name default-directory))))
 
+;;;###autoload
 (defun epica-session-list ()
   "Return all session org files under `epica-session-dir'."
   (when (file-directory-p epica-session-dir)
@@ -355,6 +360,7 @@ Uses project.el when a project is known, else `default-directory'."
   (epica--session-save)
   (run-hooks 'epica-session-shutdown-hook))
 
+;;;###autoload
 (defun epica-new-session (&optional name)
   "Create a fresh epica session buffer backed by an org file.
 NAME is used for the file and buffer name; defaults to a timestamp.
@@ -383,6 +389,7 @@ Interactively, switches to the new session buffer."
       (switch-to-buffer buf))
     buf))
 
+;;;###autoload
 (defun epica-open-session (file)
   "Open session org FILE in a buffer and set up session state."
   (let ((buf (find-file-noselect file)))
@@ -396,6 +403,7 @@ Interactively, switches to the new session buffer."
     (setq epica--current-session-buffer buf)
     buf))
 
+;;;###autoload
 (defun epica-resume ()
   "Interactively resume a saved epica session."
   (interactive)
@@ -604,6 +612,7 @@ the final answer (settle) rather than stalling the loop."
         (epica--render-assistant-end)
         (epica--settle (format "error: %s" status)))))))
 
+;;;###autoload
 (cl-defun epica-run (prompt &key buffer tools system model backend on-settled)
   "Begin an epica agent run on PROMPT.  Returns immediately (async).
 
@@ -666,6 +675,7 @@ see `epica-run-sync'."
                        :system gptel-system
                        :callback #'epica--stream-callback)))))
 
+;;;###autoload
 (cl-defun epica-run-sync (prompt &rest keys &key timeout &allow-other-keys)
   "Run `epica-run' and block until the loop settles.
 Pumps the event loop (batch/test friendly).  Returns the final text.
@@ -713,6 +723,7 @@ Returns nil if unreachable."
        (message "epica: could not discover models at %s: %S" url err)
        nil))))
 
+;;;###autoload
 (defun epica-make-llamacpp-backend (&optional host)
   "Return a gptel OpenAI backend for a llama.cpp router at HOST.
 HOST defaults to env EPICA_LLMACPP_HOST or 127.0.0.1:8331, as host:port
@@ -821,6 +832,7 @@ section's end. Unpaired sections are ignored."
                     (format-time-string "%Y%m%d-%H%M%S")))
     (insert (epica--demote text))))
 
+;;;###autoload
 (defun epica-fork (&optional n)
   "Fork the session after turn N (1-based), archiving the abandoned tail.
 With no N (interactive), forks after the turn containing point.
@@ -839,6 +851,7 @@ restored with `epica-restore-branch'."
     (epica--archive-tail (cdr (nth idx turns)))
     (epica--session-save)))
 
+;;;###autoload
 (defun epica-restore-branch (name)
   "Restore branch NAME as the active path; archive the current tail.
 This swaps: the named branch's turns become active, and the current
@@ -927,6 +940,7 @@ numbers, decisions, and the user's stated goals. 3-6 sentences."
      (message "epica: summarization failed: %S" err)
      (string-trim text))))
 
+;;;###autoload
 (defun epica-compact (&optional keep-last)
   "Summarize the oldest turns into one `* epica-summary' heading.
 Keeps the last KEEP-LAST (default 4) MESSAGES as-is. Never crosses a
@@ -1014,6 +1028,7 @@ Handles simple scalar values and folded (>) descriptions."
         (push (cons fold-key (string-join (nreverse fold-lines) " ")) alist))
       (nreverse alist))))
 
+;;;###autoload
 (defun epica-skill-scan ()
   "Scan `epica-skills-dirs' for skills. Returns ((NAME . SKILL-MD-PATH) ...)."
   (let ((found '()))
@@ -1029,6 +1044,7 @@ Handles simple scalar values and folded (>) descriptions."
                 (push (cons name md) found)))))))
     (nreverse found)))
 
+;;;###autoload
 (defun epica-skill-load (name)
   "Return the full content of skill NAME (its SKILL.md, plus script list).
 Errors list the available skills so the caller can self-correct."
@@ -1079,6 +1095,7 @@ password <key> (typically in ~/.authinfo.gpg)."
           (let ((secret (plist-get (car entry) :secret)))
             (when (functionp secret) (funcall secret)))))))
 
+;;;###autoload
 (defun epica-make-deepseek-backend (&optional api-key)
   "Return a gptel DeepSeek backend.
 API-KEY overrides; otherwise `epica--deepseek-api-key' (env then
@@ -1090,6 +1107,7 @@ auth-source). Requires an API key -- DeepSeek is not a local model."
       :key (lambda () key)
       :stream t)))
 
+;;;###autoload
 (defun epica-default-backend ()
   "TEST-HARNESS helper: pick DeepSeek (when a key exists) or llama.cpp.
 Only the automated tests and quickstart scripts call this. In REAL
@@ -1100,6 +1118,7 @@ leave `epica-backend' nil; `epica-run' falls back to `gptel-backend'."
    ((epica--deepseek-api-key) (epica-make-deepseek-backend))
    (t (epica-make-llamacpp-backend))))
 
+;;;###autoload
 (defun epica-default-model ()
   "TEST-HARNESS helper: default model symbol for `epica-default-backend'.
 Real integration sets `epica-model' or relies on gptel's own model."
