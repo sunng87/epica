@@ -1,13 +1,23 @@
 ;;; epica-ui.el --- interactive commands + transient menu for epica -*- lexical-binding: t; -*-
+;;; epica-ui.el --- interactive commands + transient menu for epica -*- lexical-binding: t; -*-
+
 
 ;; The interactive layer (build step 8): M-x commands, a transient
+;; The interactive layer (build step 8): M-x commands, a transient
+;; menu, and a minor mode for session buffers. Core (epica.el) stays
 ;; menu, and a minor mode for session buffers. Core (epica.el) stays
 ;; UI-free; this file is what a user loads to drive epica interactively.
+;; UI-free; this file is what a user loads to drive epica interactively.
+
 
 ;;; Code:
+;;; Code:
+
 
 (require 'epica)
+(require 'epica)
 (require 'epica-tools)
+(require 'subr-x)
 (require 'transient)
 
 ;;; -------------------------------------------------- commands ----------

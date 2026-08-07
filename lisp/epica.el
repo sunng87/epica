@@ -530,7 +530,7 @@ Runs in the conversation buffer so buffer-local loop state is consistent."
   "Message sent when the model ends a turn with an unfinished plan."
   :type 'string :group 'epica)
 
-(defvar epica--nudged nil
+(defvar-local epica--nudged nil
   "Non-nil if the current run already sent a plan nudge (nudge once).")
 
 (defun epica--unfinished-plan-p (text)

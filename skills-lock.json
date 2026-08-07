@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "emacs-lisp-helper": {
+      "source": "captainflasmr/ollama-buddy",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/emacs-lisp-helper/SKILL.md",
+      "computedHash": "dae77fcae8e5706a6e607c3c4460ea006b83af552d95ebcd44b6c4aa3ef3b752"
+    }
+  }
+}

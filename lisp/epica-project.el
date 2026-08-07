@@ -1,7 +1,12 @@
 ;;; epica-project.el --- project.el + vc.el tools for epica -*- lexical-binding: t; -*-
+;;; epica-project.el --- project.el + vc.el tools for epica -*- lexical-binding: t; -*-
+
 
 ;; Project and version-control awareness for epica, built entirely on
+;; Project and version-control awareness for epica, built entirely on
 ;; Emacs' own project.el and vc.el. This is also a TEMPLATE for how to
+;; Emacs' own project.el and vc.el. This is also a TEMPLATE for how to
+;; extend epica: (require 'epica) + define-epica-tool + add-hook.
 ;; extend epica: (require 'epica) + define-epica-tool + add-hook.
 ;;
 ;; Tools added:
@@ -21,8 +26,10 @@
 
 (require 'epica)
 (require 'epica-tools)
+(require 'subr-x)
 (require 'project)
 (require 'vc)
+(require 'cl-lib)
 
 
 ;;; -------------------------------------------------- context -----------
