@@ -1080,6 +1080,41 @@ Errors list the available skills so the caller can self-correct."
         skills "\n")))))
 
 
+(defcustom epica-scoped-models nil
+  "List of models for `epica-cycle-model' to cycle through.
+Each entry is a plist:
+  (:name DeepSeek-Flash :backend BACKEND :model deepseek-v4-flash)
+When nil, `epica-cycle-model' falls back to the single-backend picker."
+  :type '(repeat plist)
+  :group 'epica)
+
+(defvar epica--scoped-index 0
+  "Current index into `epica-scoped-models' (for `epica-cycle-model').")
+
+;;;###autoload
+(defun epica-cycle-model (&optional backward)
+  "Cycle to the next scoped model (or previous with BACKWARD/prefix arg).
+Sets both `epica-backend'/`epica-model' and `gptel-backend'/`gptel-model'
+so the change takes effect regardless of which path `epica-run' uses.
+When `epica-scoped-models' is nil, falls back to `epica-select-model'."
+  (interactive "P")
+  (if (null epica-scoped-models)
+      (call-interactively #'epica-select-model)
+    (let* ((n (length epica-scoped-models))
+           (idx (mod (+ epica--scoped-index (if backward -1 1)) n))
+           (entry (nth idx epica-scoped-models))
+           (backend (plist-get entry :backend))
+           (model (plist-get entry :model))
+           (name (plist-get entry :name)))
+      (setq epica--scoped-index idx)
+      (setq epica-backend backend
+            epica-model model
+            gptel-backend backend
+            gptel-model model)
+      (message "epica: %s (%s / %s)"
+               (or name (symbol-name model))
+               (gptel-backend-name backend) model))))
+
 (defcustom epica-deepseek-model "deepseek-v4-flash"
   "Default DeepSeek model when no EPICA_MODEL is set."
   :type 'string :group 'epica)

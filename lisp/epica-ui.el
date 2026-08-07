@@ -156,6 +156,7 @@ shown afterwards so the answer streams in view."
   :keymap (let ((map (make-sparse-keymap)))
             (define-key map (kbd "C-c C-s") #'epica-send)
             (define-key map (kbd "C-c C-p") #'epica-compose)
+            (define-key map (kbd "C-c M-l") #'epica-cycle-model)
             (define-key map (kbd "C-c C-m") #'epica-menu)
             (define-key map (kbd "C-c C-n") #'epica-new-session)
             (define-key map (kbd "C-c C-r") #'epica-resume)
