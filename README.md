@@ -1,13 +1,13 @@
 # epica
 
 **An Emacs-native coding agent.** epica is an LLM-powered coding harness
-that lives entirely inside Emacs — built on buffers, overlays, eshell,
-and Emacs' own code-intelligence tooling, not on a shell + filesystem
-foundation.
+that lives inside Emacs — built on live buffers, Org sessions and
+stateful Eshell, rather than treating the editor as a file viewer.
 
-> **Status:** the 8-step build (design → interactive UI) is complete and
-> all test suites pass. See [`design.org`](./design.org) for the
-> architecture.
+> **Status:** the original 8-step build (design → interactive UI) is
+> complete. Offline ERT regressions cover the current core; the older
+> model-backed integration suites have not been rerun after the latest
+> fixes. See [`design.org`](./design.org) for the architecture.
 
 ---
 
@@ -61,28 +61,35 @@ you're already looking at.
 ## What epica gives you
 
 - **Live buffer edits with free undo** — `edit-region` operates on the
-  buffer you're viewing; undo rides `buffer-undo-list`, nothing to
-  invent. Writes through `write-buffer` stay in sync with visited files
-  (no stale-modtime prompts).
-- **Narrowing is context** — `read-buffer` sees what you've narrowed,
-  not an offset/limit fiction.
-- **Markers keep edits stable** — no broken string matches when the
-  buffer changes between plan and apply.
-- **The agent's shell IS Emacs' shell** — one `eshell-run` per session,
-  stateful across calls, and every command *or elisp expression*
-  returns a value, exactly like typing in eshell.
-- **Emacs' code intelligence as tools** — xref, project, imenu, eglot
-  diagnostics; the agent navigates the way you do.
+  visible (possibly narrowed) buffer with case-sensitive, unique text
+  matching; undo rides `buffer-undo-list`. `write-buffer` edits the
+  file-visiting buffer and refuses to overwrite unsaved changes.
+- **Narrowing is context** — `read-buffer` sees the visible region;
+  optional line offsets let the model read large buffers in slices.
+- **Edits fail closed** — an ambiguous or missing match is rejected;
+  edits never target text hidden by narrowing. Stable read-to-edit
+  region handles are not implemented yet.
+- **The agent's shell IS Emacs' shell** — one stateful `eshell-run` per
+  session in interactive Emacs. Eshell commands and Elisp expressions
+  complete asynchronously without blocking redisplay. Batch-mode
+  Eshell is stateless.
+- **Project awareness as an extension** — optionally load
+  `epica-project` for project.el discovery/search and Git tools.
 - **Hooks are the extension system** — `epica-tool-call-hook` (block),
   `epica-tool-result-hook` (rewrite), `epica-session-start-hook`, …
   Any Emacs package can extend epica; there is no plugin loader.
 
-**Tools:** `read-buffer`, `edit-region`, `write-buffer`, `eshell-run`,
-`webfetch` (url.el + shr — no curl), `load-skill` (Agent Skills
-standard — pi's skills work verbatim).
+**Built-in tools:** `open-file`, `read-buffer`, `edit-region`,
+`save-buffer`, `write-buffer`, `eshell-run`, asynchronous `webfetch`
+(url.el + shr), and `load-skill`. `epica-project` adds project and Git
+tools when explicitly required. Project-local `.agents/skills/`
+overrides global skills of the same name.
 
-**Sessions** are org-mode buffers: one heading per turn, branching and
-LLM-driven compaction built in, plain readable text on disk.
+**Sessions** are file-visiting org-mode buffers: one heading per turn,
+branching and LLM-driven compaction built in. Turn and tool payloads
+use Org fixed-width lines so headings in model output cannot become
+conversation structure. The originating project directory is saved
+with the session and restored when reopened.
 
 ## Providers
 
@@ -93,6 +100,19 @@ LLM-driven compaction built in, plain readable text on disk.
 - **Test harness only:** the suites pick DeepSeek from
   `DEEPSEEK_API_KEY` (gitignored `.env`, see `.env.example`) or fall
   back to a local llama.cpp router. Real use never touches `.env`.
+
+## Offline tests
+
+Run `test/run-offline.sh` for deterministic ERT tests of session
+round-tripping, tool dispatch, asynchronous operations, buffer edits,
+skills and prompt routing. It uses local dependencies under `test/elpa/`
+and does not call an LLM or read `.env`.
+
+With a local llama.cpp router at `127.0.0.1:8331`, run
+`test/run-self-host-smoke.sh`: epica uses a local model to open/read a
+file, edit and save another, and invoke its asynchronous Eshell tool.
+It uses no cloud API key and creates only temporary test files. The
+older `test/run-step*.sh` scripts are separate model-backed checks.
 
 ## Philosophy
 

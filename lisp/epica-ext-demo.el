@@ -22,17 +22,14 @@
   "Log of results redacted by the demo hook: (TIME . RESULT).")
 
 (defcustom epica-ext-destructive-patterns
-  "Regexes that mark an eshell-run command as destructive."
-  ;; note: models try to bypass gates (find -delete, unlink, ...) —
-  ;; cover the common deletion verbs, not just rm
+  ;; Cover common deletion verbs, not just rm.
   '("\\brm\\b" "\\bsudo\\b" "\\bmkfs\\b" "\\bshred\\b"
     "\\bunlink\\b" "\\brmdir\\b" "\\btruncate\\b"
-    "\\bfind\\b.*\\b-delete\\b" "\\bdd if=")
+    "\\bfind\\b.*-delete\\b" "\\bdd if=")
   "Regexes that mark an eshell-run command as destructive."
   :type '(repeat regexp) :group 'epica)
 
 (defcustom epica-ext-secret-patterns
-  "Regexes redacted from tool results before the model sees them."
   '("TOPSECRET[A-Z0-9]*" "sk-[A-Za-z0-9_-]\\{20,\\}")
   "Regexes redacted from tool results before the model sees them."
   :type '(repeat regexp) :group 'epica)

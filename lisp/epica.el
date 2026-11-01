@@ -5,32 +5,36 @@
 ;; Package-Requires: ((emacs "29.1") (gptel "0.9") (transient "0.4"))
 ;; Keywords: ai tools convenience
 
-;; This is the epica core: a minimal agent loop on top of gptel with
-;; buffer-native tools and a hook-driven extension surface.  See
-;; design.org for the architecture and build order.
+;; This is the epica core: an agent loop on top of gptel with Org-backed
+;; sessions and a hook-driven extension surface. See design.org.
 
 ;;; Commentary:
 ;;
-;; epica is built in layers.  This file (step 2 of the build order) lands
-;; the foundation everything else extends:
+;; epica is built in layers. This file provides the foundation:
 ;;
 ;;   - `define-epica-tool'        declarative tool definition
 ;;   - tool registry              `epica-tools', `epica-register-tool', ...
 ;;   - the agent loop             `epica-run' (async) / `epica-run-sync'
 ;;   - hooks                      the extension surface (see "Hooks")
-;;   - a gptel bridge             epica hooks <-> gptel tool hooks
-;;   - conversation rendering     to a buffer (org tree comes in step 4)
+;;   - gptel request coordination and streamed Org conversation rendering
 ;;
-;; Sessions are NOT persisted yet (that is step 4).  There is one active
-;; conversation per buffer; buffer-local vars carry loop state.
+;; Sessions visit Org files; one active run per session buffer owns its
+;; loop state. Built-in tools and UI live in epica-tools and epica-ui.
 
 ;;; Code:
 
 (require 'gptel)
+(require 'gptel-org) ; gptel-request streams into epica's Org session buffer
 (require 'cl-lib)
+(declare-function gptel-make-openai "gptel-openai")
+(declare-function gptel-make-deepseek "gptel-openai-extras")
 (require 'subr-x)
 (require 'json)
 (require 'url)
+
+(defgroup epica nil
+  "An Emacs-native, extensible coding agent."
+  :group 'applications)
 
 
 ;;; -------------------------------------------------- customization ----
@@ -197,11 +201,10 @@ Registers a gptel-tool in `epica-tools' and returns it.
 Example:
   (define-epica-tool read-buffer
     ((name string \"Buffer name to read\"))
-    \"Read a live Emacs buffer's contents.\"
+    \"Read the contents of a live Emacs buffer.\"
     (if-let ((buf (get-buffer name)))
         (list :content (with-current-buffer buf (buffer-string)))
-      (list :content (format \"No buffer named %s. Live: %S\"
-                             name (mapcar #'buffer-name (buffer-list)))
+      (list :content (format \"No buffer named %s\" name)
             :error t)))"
   (declare (indent defun) (doc-string 3))
   (let* ((fn-name (intern (format "epica-tool--%s" name)))
@@ -217,18 +220,24 @@ Example:
            args)))
     ;; gptel applies tool args POSITIONALLY (see gptel--map-tool-args),
     ;; so the generated function takes the arg symbols in declaration order.
-    (let ((args-plist-form
-           (append '(list)
-                   (cl-mapcan (lambda (sy)
-                                 (list (intern (format ":%s" sy)) sy))
-                               arg-syms))))
+    (let* ((args-plist-form
+            (append '(list)
+                    (cl-mapcan (lambda (sy)
+                                  (list (intern (format ":%s" sy)) sy))
+                                arg-syms)))
+           (modified-args (make-symbol "modified-args"))
+           (bindings (mapcar (lambda (sy)
+                               (list sy (list 'plist-get modified-args
+                                              (intern (format ":%s" sy)))))
+                             arg-syms)))
       `(progn
          (defun ,fn-name ,arg-syms
            ,(format "epica tool `%S'.\n%s" name docstring)
            (epica--call-with-hooks
             ,(symbol-name name)
             ,args-plist-form
-            (lambda () ,@body)))
+            (lambda (,modified-args)
+              (let ,bindings ,@body))))
          (let ((tool (gptel-make-tool
                       :function #',fn-name
                       :name ,(symbol-name name)
@@ -236,6 +245,47 @@ Example:
                       :args (quote ,gptel-args))))
            (epica-register-tool tool)
            tool)))))
+
+;;;###autoload
+(defmacro define-epica-async-tool (name args docstring &rest body)
+  "Define asynchronous tool NAME with ARGS, DOCSTRING and BODY.
+BODY receives a lexically bound CALLBACK and must invoke it once with
+its result, possibly after returning. The generated tool participates
+in the same call/result hooks as `define-epica-tool'."
+  (declare (indent defun) (doc-string 3))
+  (let* ((fn-name (intern (format "epica-tool--%s" name)))
+         (arg-syms (mapcar #'car args))
+         (modified-args (make-symbol "modified-args"))
+         (gptel-args
+          (mapcar (lambda (spec)
+                    (cl-destructuring-bind (sym type desc &rest opts) spec
+                      (append (list :name (symbol-name sym)
+                                    :type type :description desc)
+                              opts)))
+                  args))
+         (args-plist-form
+          (append '(list)
+                  (cl-mapcan (lambda (sy)
+                               (list (intern (format ":%s" sy)) sy))
+                             arg-syms)))
+         (bindings (mapcar (lambda (sy)
+                             (list sy (list 'plist-get modified-args
+                                            (intern (format ":%s" sy)))))
+                           arg-syms)))
+    `(progn
+       (defun ,fn-name (callback ,@arg-syms)
+         ,(format "Async epica tool `%S'.\n%s" name docstring)
+         (epica--call-with-hooks-async
+          ,(symbol-name name) ,args-plist-form
+          (lambda (callback ,modified-args)
+            (let ,bindings ,@body))
+          callback))
+       (let ((tool (gptel-make-tool
+                    :function #',fn-name :async t
+                    :name ,(symbol-name name)
+                    :description ,docstring :args (quote ,gptel-args))))
+         (epica-register-tool tool)
+         tool))))
 
 (defun epica--coerce-tool-result (res)
   "Coerce an epica tool BODY return value to the string gptel expects.
@@ -249,67 +299,82 @@ RES may be a string or a plist with a :content key."
             (t (format "%S" content)))))
    (t (format "%S" res))))
 
-(defun epica--call-with-hooks (name args-plist body-fn)
-  "Run an epica tool BODY-FN wrapped in the call/result hooks.
-NAME is the tool name string, ARGS-PLIST is the (:arg val...) the tool
-was called with, BODY-FN is a zero-arg function returning the tool body
-value (string or plist).
-Fires `epica-tool-call-hook' first; BLOCK by returning a string reason
-or (block . REASON). Any other return (nil or otherwise) only observes --
-so a hook that forgets to return nil never accidentally blocks. Then runs
-the body, fires `epica-tool-result-hook' with the coerced result, and
-returns the coerced string gptel expects."
-  (let* ((info (list :name name :args args-plist
-                     :tool (epica-get-tool name)
-                     :buffer (buffer-name)))
-         (block-reason
-          (catch 'epica--tool-blocked
-            (dolist (fn epica-tool-call-hook)
-              (when (functionp fn)
-                (let ((r (funcall fn info)))
-                  (cond
-                   ((null r))                      ; observe
-                   ((stringp r) (throw 'epica--tool-blocked r))
-                   ((and (consp r) (eq (car r) 'block))
-                    (throw 'epica--tool-blocked (cdr r)))
-                   ;; any other non-nil: lenient, treat as observe
-                   ))))
-            nil))
-         (result
-          (if block-reason
-              (list :content (if (stringp block-reason)
-                                 block-reason
-                               (format "%S" block-reason))
-                    :error t)
-            (condition-case err
-                (funcall body-fn)
-              (error (list :content (format "error: %S" err) :error t)))))
-         (coerced (epica--coerce-tool-result result))
-         (replacement nil))
-    ;; result hooks: all run for side effects; the LAST string return wins
-    ;; and replaces what the model sees.
-    (dolist (fn epica-tool-result-hook)
-      (when (functionp fn)
-        (let ((r (funcall fn (list :name name :args args-plist
-                                   :result coerced
-                                   :buffer (buffer-name)))))
-          (when (stringp r) (setq replacement r)))))
+(defun epica--tool-call-context (name args-plist)
+  "Run call hooks for NAME and ARGS-PLIST, returning (INFO . BLOCK-REASON).
+INFO is shared with hooks so they may replace its :args. The first
+explicit block wins, but local and global observers all run."
+  (let ((info (list :name name :args args-plist
+                    :tool (epica-get-tool name) :buffer (buffer-name)))
+        (blocked nil))
+    (run-hook-wrapped
+     'epica-tool-call-hook
+     (lambda (fn)
+       (let ((r (funcall fn info)))
+         (when (and (not blocked)
+                    (or (stringp r)
+                        (and (consp r) (eq (car r) 'block))))
+           (setq blocked (cons t (if (stringp r) r (cdr r)))))
+       nil)))
+    (cons info blocked)))
+
+(defun epica--tool-result-with-hooks (info result)
+  "Coerce RESULT and run result hooks using call context INFO."
+  (let ((coerced (epica--coerce-tool-result result)) replacement)
+    (run-hook-wrapped
+     'epica-tool-result-hook
+     (lambda (fn)
+       (let ((r (funcall fn (list :name (plist-get info :name)
+                                  :args (plist-get info :args)
+                                  :result coerced
+                                  :buffer (plist-get info :buffer)))))
+         (when (stringp r) (setq replacement r)))
+       nil))
     (or replacement coerced)))
+
+(defun epica--call-with-hooks (name args-plist body-fn)
+  "Call BODY-FN with tool hooks around it, passing rewritten args.
+A zero-argument BODY-FN is accepted for older extension code."
+  (pcase-let* ((`(,info . ,blocked)
+                (epica--tool-call-context name args-plist))
+               (result
+                (if blocked
+                    (list :content (format "%s" (cdr blocked)) :error t)
+                  (condition-case err
+                      (if (zerop (car (func-arity body-fn)))
+                          (funcall body-fn)
+                        (funcall body-fn (plist-get info :args)))
+                    (error (list :content (format "error: %S" err)
+                                 :error t))))))
+    (epica--tool-result-with-hooks info result)))
+
+(defun epica--call-with-hooks-async (name args-plist body-fn callback)
+  "Start asynchronous BODY-FN under tool hooks and invoke CALLBACK once.
+BODY-FN receives a completion callback and possibly rewritten args.
+Result hooks run in the originating session buffer when it is live."
+  (let* ((origin (current-buffer))
+         (context (epica--tool-call-context name args-plist))
+         (info (car context))
+         (blocked (cdr context))
+         (done nil))
+    (cl-labels ((finish (result)
+                  (unless done
+                    (setq done t)
+                    (when (buffer-live-p origin)
+                      (with-current-buffer origin
+                        (funcall callback
+                                 (epica--tool-result-with-hooks info result)))))))
+      (if blocked
+          (finish (list :content (format "%s" (cdr blocked)) :error t))
+        (condition-case err
+            (funcall body-fn #'finish (plist-get info :args))
+          (error (finish (list :content (format "error: %S" err)
+                               :error t))))))))
 
 
 
-;;; --- tool hooks (fired from epica's own callback) -----------------
-;;
-;; NOTE: gptel-request (the programmatic API) does NOT run
-;; `gptel-pre/post-tool-call-functions' -- those are exclusive to the
-;; interactive gptel-send path. So epica fires `epica-tool-call-hook'
-;; and `epica-tool-result-hook' directly from its streaming callback,
-;; which DOES receive (tool-call ...) and (tool-result ...) events.
-;;
-;; Step 2 hooks are observe-only. Blocking a tool call before it runs
-;; requires epica to own tool dispatch (handle the tool-call event, run
-;; the tool itself, continue via gptel's continuation callback) -- a
-;; refinement for a later build step.
+;; gptel-request does not run gptel's interactive pre/post tool hooks.
+;; The wrapper generated by `define-epica-tool' runs epica's hooks around
+;; automatic calls; confirmed calls also go through that wrapper.
 
 
 ;;; -------------------------------------------------- sessions ----------
@@ -340,7 +405,7 @@ returns the coerced string gptel expects."
 (defun epica--project-root ()
   "Directory used to namespace sessions for the current project.
 Uses project.el when a project is known, else `default-directory'."
-  (or (when-let ((pr (project-current)))
+  (or (when-let* ((pr (project-current)))
         (file-name-as-directory (directory-file-name (project-root pr))))
       (file-name-as-directory (expand-file-name default-directory))))
 
@@ -356,7 +421,8 @@ Uses project.el when a project is known, else `default-directory'."
     (save-buffer)))
 
 (defun epica--session-teardown ()
-  "Save + fire `epica-session-shutdown-hook' when a session buffer dies."
+  "Abort a running request, save and notify when a session buffer dies."
+  (when epica--running (gptel-abort (current-buffer)))
   (epica--session-save)
   (run-hooks 'epica-session-shutdown-hook))
 
@@ -371,35 +437,64 @@ Interactively, switches to the new session buffer."
          ;; namespace under the session dir by the path relative to /
          ;; (expand-file-name ignores the base when ROOT is absolute)
          (dir (expand-file-name (file-relative-name root "/") epica-session-dir))
-         (base (or name (format-time-string "%Y%m%d-%H%M%S")))
-         (file (expand-file-name (concat base ".org") dir))
-         (buf (generate-new-buffer (format "%s%s" epica-session-buffer-prefix base))))
-    (make-directory dir t)
-    (with-current-buffer buf
-      (funcall epica-conversation-major-mode)
-      (when epica-visual-line (visual-line-mode 1))
-      (setq-local epica-session-file file)
-      (setq-local buffer-file-name file)
-      (setq-local buffer-save-without-query t)
-      (insert (format "#+title: epica session %s\n" base))
-      (add-hook 'kill-buffer-hook #'epica--session-teardown nil t)
-      (run-hooks 'epica-session-start-hook))
-    (setq epica--current-session-buffer buf)
-    (when (called-interactively-p 'any)
-      (switch-to-buffer buf))
-    buf))
+         (base (or name (format-time-string "%Y%m%d-%H%M%S-%3N"))))
+    (unless (and (stringp base)
+                 (not (string-empty-p base))
+                 (equal base (file-name-nondirectory base))
+                 (not (member base '("." ".."))))
+      (user-error "Session name must be a simple filename: %S" base))
+    (let ((file (expand-file-name (concat base ".org") dir)))
+      (make-directory dir t)
+      (when (file-exists-p file)
+        (user-error "Session already exists: %s" file))
+      ;; Visit a real file: Emacs owns autosave, modtimes and save hooks.
+      (with-temp-file file
+        (insert (format "#+title: epica session %s\n#+epica_project_root: %s\n"
+                        base root)))
+      (let ((buf (find-file-noselect file)))
+        (with-current-buffer buf
+          (rename-buffer (format "%s%s" epica-session-buffer-prefix base) t)
+          (funcall epica-conversation-major-mode)
+          (setq default-directory root)
+          (when epica-visual-line (visual-line-mode 1))
+          (setq-local epica-session-file file)
+          (setq-local buffer-save-without-query t)
+          (auto-save-mode 1)
+          (add-hook 'kill-buffer-hook #'epica--session-teardown nil t)
+          (run-hooks 'epica-session-start-hook))
+        (setq epica--current-session-buffer buf)
+        (when (called-interactively-p 'any)
+          (switch-to-buffer buf))
+        buf))))
 
 ;;;###autoload
 (defun epica-open-session (file)
   "Open session org FILE in a buffer and set up session state."
   (let ((buf (find-file-noselect file)))
     (with-current-buffer buf
-      (funcall epica-conversation-major-mode)
-      (when epica-visual-line (visual-line-mode 1))
-      (setq-local epica-session-file file)
-      (setq-local buffer-save-without-query t)
-      (add-hook 'kill-buffer-hook #'epica--session-teardown nil t)
-      (run-hooks 'epica-session-start-hook))
+      (unless epica-session-file
+        (funcall epica-conversation-major-mode)
+        (let ((root
+               (or (save-excursion
+                     (goto-char (point-min))
+                     (when (re-search-forward
+                            "^#\\+epica_project_root: \\(.*\\)$" nil t)
+                       (match-string-no-properties 1)))
+                   ;; Older session files encode the project path under
+                   ;; epica-session-dir but have no project-root keyword.
+                   (when (file-in-directory-p file epica-session-dir)
+                     (expand-file-name
+                      (file-relative-name (file-name-directory file)
+                                          epica-session-dir)
+                      "/")))))
+          (when (and root (file-directory-p root))
+            (setq default-directory (file-name-as-directory root))))
+        (when epica-visual-line (visual-line-mode 1))
+        (setq-local epica-session-file file)
+        (setq-local buffer-save-without-query t)
+        (auto-save-mode 1)
+        (add-hook 'kill-buffer-hook #'epica--session-teardown nil t)
+        (run-hooks 'epica-session-start-hook)))
     (setq epica--current-session-buffer buf)
     buf))
 
@@ -410,31 +505,35 @@ Interactively, switches to the new session buffer."
   (let ((file (completing-read "Resume session: " (epica-session-list))))
     (switch-to-buffer (epica-open-session file))))
 
-(defun epica--assistant-tool-section-p (text)
-  "Non-nil if TEXT is a tool-only assistant section (starts with ** tool-)."
-  (string-match-p "^[ \t]*\\*\\* tool-" (or text "")))
+(defun epica--decode-turn (text)
+  "Decode a turn body TEXT, accepting older unquoted session bodies too.
+New sessions prefix each payload line with `: ' so Org headings and
+blocks in model output remain data rather than session structure."
+  (if (string-prefix-p ": " text)
+      (let ((lines (split-string text "\n" nil)))
+        ;; The last newline separates this body from the next heading;
+        ;; an actual trailing newline in the payload has its own `: ' line.
+        (while (equal (car (last lines)) "")
+          (setq lines (butlast lines)))
+        (mapconcat (lambda (line)
+                     (if (string-prefix-p ": " line)
+                         (substring line 2)
+                       line))
+                   lines "\n"))
+    (string-trim text)))
 
 (defun epica--session-messages ()
-  "Parse the current buffer (an epica session org) into ((KIND . TEXT) ...).
-KIND is `user' or `assistant'. Tool-only assistant sections (no answer
-text, only ** tool-* subheadings) are excluded, as are branch and
-summary containers."
-  (let ((msgs '()))
+  "Parse top-level user/assistant Org headings into ((KIND . TEXT) ...).
+Tool subheadings, archived branches and summaries are not LLM turns."
+  (let (msgs)
     (dolist (sec (epica--level1-sections))
-      (pcase (car sec)
-        ('user
-         (push (cons 'user
-                     (string-trim
-                      (buffer-substring-no-properties
-                       (epica--section-start sec) (epica--section-end sec))))
-               msgs))
-        ('assistant
-         (let ((text (string-trim
-                      (buffer-substring-no-properties
-                       (epica--section-start sec) (epica--section-end sec)))))
-           (unless (epica--assistant-tool-section-p text)
-             (push (cons 'assistant text) msgs))))
-        (_ nil)))
+      (when (memq (car sec) '(user assistant))
+        (let ((text (epica--decode-turn
+                     (buffer-substring-no-properties
+                      (epica--section-start sec)
+                      (epica--section-body-end sec)))))
+          (unless (and (eq (car sec) 'assistant) (string-empty-p text))
+            (push (cons (car sec) text) msgs)))))
     (nreverse msgs)))
 
 (defun epica--session-history ()
@@ -459,36 +558,67 @@ Merges consecutive same-role sections defensively."
 (defvar-local epica--final-text nil)
 (defvar-local epica--on-settled nil)
 (defvar-local epica--turn-got-text nil)
-(defvar-local epica--turn-got-tool nil)
 (defvar-local epica--assistant-accum nil)
 (defvar-local epica--in-assistant nil)
+(defvar-local epica--running nil
+  "Non-nil while an agent run owns this session buffer.")
+(defvar-local epica--run-id 0
+  "Generation of the current run; stale callbacks must not alter it.")
+(defvar-local epica--compacting nil
+  "Non-nil while this session's history is being compacted.")
+(defvar-local epica--run-system nil
+  "Effective system prompt for the current run, including extensions.")
 
 (defun epica--conv-buffer (&optional create)
-  "Return the active epica session buffer, creating a session if CREATE."
-  (or (and (buffer-live-p epica--current-session-buffer)
+  "Return this buffer's session, the last active one, or create one."
+  (or (and epica-session-file (current-buffer))
+      (and (buffer-live-p epica--current-session-buffer)
            epica--current-session-buffer)
       (and create (epica-new-session))))
 
+(defvar-local epica--assistant-at-line-start t
+  "Non-nil if the next streamed assistant character begins a payload line.")
+
+(defun epica--render-quoted (text)
+  "Insert TEXT as fixed-width Org payload lines, including empty lines."
+  (insert ": " (replace-regexp-in-string "\n" "\n: " text t t) "\n"))
+
 (defun epica--render-user (text)
-  "Append a user turn as an org heading to the session buffer."
+  "Append user TEXT as a quoted Org payload beneath a heading."
   (goto-char (point-max))
-  (insert (format "* user\n%s\n" text)))
+  (unless (bolp) (insert "\n"))
+  (insert "* user\n")
+  (epica--render-quoted text))
 
 (defun epica--render-assistant-start ()
-  "Ensure an `* assistant' org heading exists for the current turn."
+  "Ensure an `* assistant' Org heading exists for the current turn."
   (unless epica--in-assistant
     (goto-char (point-max))
-    (insert "\n* assistant\n")
-    (setq epica--in-assistant t)))
+    (unless (bolp) (insert "\n"))
+    (insert "* assistant\n")
+    (setq epica--in-assistant t
+          epica--assistant-at-line-start t)))
 
 (defun epica--render-assistant-chunk (chunk)
-  "Stream an assistant text CHUNK under the current assistant heading."
+  "Stream assistant CHUNK, quoting Org syntax across chunk boundaries."
   (epica--render-assistant-start)
   (goto-char (point-max))
-  (insert chunk))
+  (let ((parts (split-string chunk "\n" nil)))
+    (when (not (string-empty-p chunk))
+      (while parts
+        (when epica--assistant-at-line-start
+          (insert ": ")
+          (setq epica--assistant-at-line-start nil))
+        (insert (pop parts))
+        (when parts
+          (insert "\n")
+          (setq epica--assistant-at-line-start t))))))
 
 (defun epica--render-assistant-end ()
-  "Finalize the current assistant turn."
+  "Finalize the current assistant turn on a heading boundary."
+  (when epica--in-assistant
+    (goto-char (point-max))
+    (unless (bolp) (insert "\n")))
   (setq epica--in-assistant nil))
 
 (defun epica--render-reasoning (_chunk)
@@ -497,41 +627,50 @@ Deliberately not rendered: it would pollute the session org file."
   nil)
 
 (defun epica--render-tool-call (entries)
-  "Render tool-call ENTRIES as `** tool-call' org subheadings."
+  "Render tool-call ENTRIES as `** tool-call' Org subheadings."
   (epica--render-assistant-start)
+  (epica--render-assistant-end)
   (dolist (entry entries)
     (goto-char (point-max))
-    (insert (format "** tool-call: %s\n#+begin_example\n%S\n#+end_example\n"
-                    (gptel-tool-name (car entry)) (cadr entry)))))
+    (insert (format "** tool-call: %s\n" (gptel-tool-name (car entry))))
+    (epica--render-quoted (format "%S" (cadr entry)))))
 
 (defun epica--render-tool-result (entries)
-  "Render tool-result ENTRIES as `** tool-result' org subheadings."
+  "Render tool-result ENTRIES as `** tool-result' Org subheadings."
+  (unless (eq (car (car (last (epica--level1-sections)))) 'assistant)
+    (epica--render-assistant-start)
+    (epica--render-assistant-end))
   (dolist (entry entries)
     (goto-char (point-max))
+    (unless (bolp) (insert "\n"))
+    (insert "** tool-result\n")
     (let ((result (caddr entry)))
-      (insert (format "** tool-result\n#+begin_example\n%s\n#+end_example\n"
-                      (if (stringp result) result (format "%S" result)))))))
+      (epica--render-quoted
+       (if (stringp result) result (format "%S" result))))))
 
 
 ;;; -------------------------------------------------- agent loop -------
 
 (defun epica--settle (&optional error-msg)
-  "Mark the active loop settled, save the session, fire hooks.
-If ERROR-MSG is non-nil the loop ended in error."
-  (setq epica--settled t)
-  (epica--session-save)
-  (run-hooks 'epica-agent-settled-hook)
-  (when epica--on-settled
-    (funcall epica--on-settled epica--final-text error-msg)))
+  "Settle the current run once, save its session and notify listeners.
+If ERROR-MSG is non-nil the run ended in error."
+  (unless epica--settled
+    (setq epica--settled t
+          epica--running nil)
+    (epica--session-save)
+    (run-hooks 'epica-agent-settled-hook)
+    (when epica--on-settled
+      (funcall epica--on-settled epica--final-text error-msg))))
 
-(defun epica--stream-callback (response info)
-  "gptel streaming callback that drives the epica loop.
-RESPONSE follows `gptel-request' conventions; INFO is the request plist.
-Runs in the conversation buffer so buffer-local loop state is consistent."
+(defun epica--stream-callback (run-id response info)
+  "Handle gptel RESPONSE/INFO for RUN-ID only while its buffer is live.
+Late callbacks from a cancelled or superseded run must not change a
+newer conversation's state."
   (let ((buf (plist-get info :buffer)))
-    (when buf
+    (when (buffer-live-p buf)
       (with-current-buffer buf
-        (epica--handle-stream-event response info)))))
+        (when (and epica--running (= run-id epica--run-id))
+          (epica--handle-stream-event response info))))))
 
 (defcustom epica-plan-nudge
   "Please proceed with the action you described: call the tools you mentioned instead of just describing them."
@@ -559,16 +698,16 @@ If the model ends a second turn with an unfinished plan, accept it as
 the final answer (settle) rather than stalling the loop."
   (if epica--nudged
       (epica--settle)
-    (setq epica--nudged t)
-    (message "epica: turn ended with an unfinished plan; nudging to continue")
-    (epica--render-user epica-plan-nudge)
-    (run-hooks 'epica-turn-start-hook)
-    (gptel-request epica-plan-nudge
-      :stream t :buffer (current-buffer)
-      :system (if (epica--session-history)
-                  (cons gptel-system-prompt (epica--session-history))
-                gptel-system-prompt)
-      :callback #'epica--stream-callback)))
+    (let ((history (epica--session-history)))
+      (setq epica--nudged t)
+      (message "epica: turn ended with an unfinished plan; nudging to continue")
+      (epica--render-user epica-plan-nudge)
+      (run-hooks 'epica-turn-start-hook)
+      (gptel-request epica-plan-nudge
+        :stream t :buffer (current-buffer)
+        :system (if history (cons epica--run-system history)
+                  epica--run-system)
+        :callback (apply-partially #'epica--stream-callback epica--run-id)))))
 
 (defun epica--handle-stream-event (response info)
   "Body of `epica--stream-callback', run in the conversation buffer."
@@ -584,33 +723,46 @@ the final answer (settle) rather than stalling the loop."
      ((eq response t)
       (epica--render-assistant-end)
       (run-hooks 'epica-turn-end-hook)
-      (if (and epica--turn-got-text (not epica--turn-got-tool))
-          ;; final answer turn: settle, unless it reads like an
-          ;; unfinished plan (small reasoning models announce tool use
-          ;; and stop). Then nudge and continue instead.
-          (if (epica--unfinished-plan-p epica--final-text)
-              (epica--nudge-continue)
-            (epica--settle))
-        ;; tool turn: gptel will run tools and start a new request
+      (cond
+       ;; gptel's streaming `t' arrives before it dispatches automatic
+       ;; tool calls.  `tool-call' events are ONLY calls needing confirmation.
+       ((plist-get info :tool-use)
         (run-hooks 'epica-turn-start-hook))
+       ((and epica--turn-got-text
+             (epica--unfinished-plan-p epica--assistant-accum))
+        (epica--nudge-continue))
+       (t (epica--settle)))
       (setq epica--turn-got-text nil
-            epica--turn-got-tool nil
             epica--assistant-accum nil))
      ;; reasoning chunk (thinking models)
      ((and (consp response) (eq (car response) 'reasoning))
       (epica--render-reasoning (cdr response)))
-     ;; tool call (gptel about to run it)
+     ;; gptel sends tool-call events only for calls requiring confirmation.
+     ;; Each entry supplies a continuation; not calling it hangs the request.
      ((and (consp response) (eq (car response) 'tool-call))
-      (setq epica--turn-got-tool t)
-      (epica--render-tool-call (cdr response)))
+      (epica--render-tool-call (cdr response))
+      (dolist (entry (cdr response))
+        (pcase-let ((`(,tool ,args ,continue) entry))
+          (if (and (not noninteractive)
+                   (y-or-n-p (format "Allow epica tool %s with %S? "
+                                     (gptel-tool-name tool) args)))
+              (condition-case err
+                  (let ((values (gptel--map-tool-args tool args)))
+                    (if (gptel-tool-async tool)
+                        (apply (gptel-tool-function tool) continue values)
+                      (funcall continue
+                               (apply (gptel-tool-function tool) values))))
+                (error (funcall continue (format "Tool error: %S" err))))
+            (funcall continue "Tool call declined by user.")))))
      ;; tool result
      ((and (consp response) (eq (car response) 'tool-result))
       (epica--render-tool-result (cdr response)))
-     ;; null response: error or abort
+     ((eq response 'abort)
+      (epica--render-assistant-end)
+      (epica--settle "Request aborted"))
      ((null response)
-      (when (gptel--error-p info)
-        (epica--render-assistant-end)
-        (epica--settle (format "error: %s" status)))))))
+      (epica--render-assistant-end)
+      (epica--settle (format "Request failed: %s" (or status "no response")))))))
 
 ;;;###autoload
 (cl-defun epica-run (prompt &key buffer tools system model backend on-settled)
@@ -622,20 +774,25 @@ TOOLS overrides `epica-tools'; SYSTEM/MODEL/BACKEND override the defaults.
 system prompt. When the loop settles, calls (ON-SETTLED FINAL-TEXT
 ERROR-MSG) and runs `epica-agent-settled-hook'.  For a blocking variant
 see `epica-run-sync'."
-  ;; collect system-prompt additions from before-agent-start-hook
-  (let* ((sys-extra
-          (let ((acc '()))
-            (dolist (fn epica-before-agent-start-hook)
-              (when (functionp fn)
-                (let ((r (funcall fn)))
-                  (when (stringp r) (push r acc)))))
-            (nreverse acc)))
-         (buf (or buffer (epica--conv-buffer t)))
+  (let* ((buf (or buffer (epica--conv-buffer t)))
          (active-tools (or tools epica-tools)))
     (with-current-buffer buf
-      ;; capture conversation history BEFORE rendering the new user turn,
-      ;; so the new message isn't included in the template
-      (let* ((history (epica--session-history))
+      (when (or epica--running epica--compacting)
+        (user-error "An epica run or compaction is already active in %s"
+                    (buffer-name buf)))
+      ;; Run hooks in the owning session so project/context extensions see
+      ;; its workspace, not the prompt buffer or another selected buffer.
+      (let* ((sys-extra
+              (let (acc)
+                (run-hook-wrapped
+                 'epica-before-agent-start-hook
+                 (lambda (fn)
+                   (let ((r (funcall fn)))
+                     (when (stringp r) (push r acc)))
+                   nil))
+                (nreverse acc)))
+             ;; capture history BEFORE rendering the new user turn
+             (history (epica--session-history))
              (summaries (epica--session-summaries))
              (base-sys (string-join
                         (cons (or system epica-system-prompt) sys-extra)
@@ -653,12 +810,15 @@ see `epica-run-sync'."
         ;; reset per-run loop state
         (setq epica--nudged nil
               epica--settled nil
+              epica--run-id (1+ epica--run-id)
+              epica--running t
+              epica--run-system sys
               epica--final-text nil
               epica--on-settled on-settled
               epica--turn-got-text nil
-              epica--turn-got-tool nil
               epica--assistant-accum nil
-              epica--in-assistant nil)
+              epica--in-assistant nil
+              epica--assistant-at-line-start t)
         ;; gptel configuration on this buffer
         (setq-local gptel-backend (or backend epica-backend gptel-backend))
         (setq-local gptel-model (or model epica-model gptel-model))
@@ -671,9 +831,14 @@ see `epica-run-sync'."
         ;; render + fire
         (epica--render-user prompt)
         (run-hooks 'epica-turn-start-hook)
-        (gptel-request prompt :stream t :buffer buf
-                       :system gptel-system
-                       :callback #'epica--stream-callback)))))
+        (condition-case err
+            (gptel-request prompt :stream t :buffer buf
+                           :system gptel-system
+                           :callback (apply-partially #'epica--stream-callback
+                                                      epica--run-id))
+          (error
+           (epica--settle (error-message-string err))
+           (signal (car err) (cdr err))))))))
 
 ;;;###autoload
 (cl-defun epica-run-sync (prompt &rest keys &key timeout &allow-other-keys)
@@ -699,6 +864,11 @@ Bounds the wait at `epica-sync-timeout' seconds (or TIMEOUT)."
           (message "epica: waiting %ds finished=%s"
                    (truncate (time-to-seconds (time-since start))) finished))))
     (unless finished
+      (let ((buf (or (plist-get fwd :buffer) (epica--conv-buffer))))
+        (when (buffer-live-p buf)
+          (gptel-abort buf)
+          (with-current-buffer buf
+            (epica--settle "Request timed out"))))
       (message "epica-run-sync: timed out after %ss" (or timeout epica-sync-timeout)))
     final))
 
@@ -729,6 +899,7 @@ Returns nil if unreachable."
 HOST defaults to env EPICA_LLMACPP_HOST or 127.0.0.1:8331, as host:port
 with NO scheme.  Discovers the router's model list so any local id is
 accepted by gptel."
+  (require 'gptel-openai)
   (let* ((h (or host (getenv "EPICA_LLMACPP_HOST") "127.0.0.1:8331"))
          (models (epica--discover-openai-models h "http")))
     (gptel-make-openai "llama.cpp"
@@ -750,36 +921,67 @@ accepted by gptel."
 ;; `* epica-summary' headings hold compacted turns (see below).
 
 (defun epica--level1-sections ()
-  "Return ((TYPE (START . END)) ...) for every level-1 org heading section.
-TYPE is one of `user', `assistant', `branch', `summary', `other'.
-START is just after the heading line; END is the next level-1 heading
-(or point-max). Sub-headings (tool-calls) are inside their section."
-  (let ((sections '())
-        (cur-type nil) (cur-start nil))
+  "Return (TYPE HEADING BODY BODY-END END) for each top-level Org heading.
+Quoted payload lines cannot introduce headings.  Also skip example/src
+blocks from older sessions, even if their Org markup is malformed."
+  (let (sections current block)
     (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward "^\\* \\([^[:space:]]+\\)[^\n]*\n" nil t)
-        (let ((word (match-string 1)))
-          (when cur-type
-            (push (cons cur-type (cons cur-start (match-beginning 0))) sections))
-          (setq cur-type (cond
-                          ((equal word "user") 'user)
-                          ((equal word "assistant") 'assistant)
-                          ((string-prefix-p "epica-branch" word) 'branch)
-                          ((string-prefix-p "epica-summary" word) 'summary)
-                          (t 'other))
-                cur-start (point))))
-      (when cur-type
-        (push (cons cur-type (cons cur-start (point-max))) sections)))
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (while (< (point) (point-max))
+          (let ((begin (point))
+                (line (buffer-substring-no-properties
+                       (line-beginning-position) (line-end-position))))
+            (cond
+             (block
+              (when (string-match-p
+                     (format "^[ \t]*#\\+end_%s[ \t]*$" block) line)
+                (setq block nil)))
+             ((string-match "^[ \t]*#\\+begin_\\(example\\|src\\|verse\\|export\\)\\b" line)
+              (setq block (match-string 1 line)))
+             ((string-match "^\\(\\*+\\) \\(.*\\)$" line)
+              (let ((level (length (match-string 1 line)))
+                    (word (car (split-string (match-string 2 line)))))
+                (cond
+                 ((= level 1)
+                  (when current
+                    (setf (nth 4 current) begin)
+                    (push current sections))
+                  (setq current
+                        (list (cond ((equal word "user") 'user)
+                                    ((equal word "assistant") 'assistant)
+                                    ((equal word "epica-branch:") 'branch)
+                                    ((equal word "epica-summary:") 'summary)
+                                    (t 'other))
+                              begin (min (point-max) (1+ (line-end-position)))
+                              nil nil)))
+                 ((and current (null (nth 3 current)))
+                  (setf (nth 3 current) begin))))))
+            (forward-line 1)))
+        (when current
+          (setf (nth 4 current) (point-max))
+          (push current sections))))
+    (dolist (sec sections)
+      (unless (nth 3 sec)
+        (setf (nth 3 sec) (nth 4 sec))))
     (nreverse sections)))
 
+(defun epica--section-heading (sec)
+  "Position of the heading starting SEC."
+  (nth 1 sec))
+
 (defun epica--section-start (sec)
-  "START position of level-1 section SEC (a dotted (TYPE . (START . END)))."
-  (car (cdr sec)))
+  "Position just after SEC's heading line."
+  (nth 2 sec))
+
+(defun epica--section-body-end (sec)
+  "End of SEC's own text, excluding tool subheadings."
+  (nth 3 sec))
 
 (defun epica--section-end (sec)
-  "END position of level-1 section SEC (a dotted (TYPE . (START . END)))."
-  (cdr (cdr sec)))
+  "Position after SEC, including subheadings."
+  (nth 4 sec))
 
 (defun epica--turns ()
   "Return ((START . END) ...) of each complete user->assistant turn.
@@ -789,10 +991,10 @@ section's end. Unpaired sections are ignored."
         (turns '()) (pending nil))
     (dolist (sec sections)
       (pcase (car sec)
-        ('user (setq pending (cdr sec)))
+        ('user (setq pending (epica--section-heading sec)))
         ('assistant (when pending
-                      ;; turn = (USER-SECTION-START . ASSISTANT-SECTION-END)
-                      (push (cons (car pending) (cdr (cdr sec))) turns)
+                      ;; turn = (USER-HEADING . ASSISTANT-SECTION-END)
+                      (push (cons pending (epica--section-end sec)) turns)
                       (setq pending nil)))
         (_ (setq pending nil))))
     (nreverse turns)))
@@ -828,7 +1030,8 @@ section's end. Unpaired sections are ignored."
   (let ((text (buffer-substring-no-properties start (point-max))))
     (delete-region start (point-max))
     (goto-char (point-max))
-    (insert (format "\n* epica-branch: %s\n"
+    (unless (bolp) (insert "\n"))
+    (insert (format "* epica-branch: %s\n"
                     (format-time-string "%Y%m%d-%H%M%S")))
     (insert (epica--demote text))))
 
@@ -873,7 +1076,8 @@ continuation is archived as a new `* epica-branch:' container."
       (goto-char (point-max))
       (insert (epica--promote contents))
       (unless (string-empty-p (string-trim tail))
-        (insert (format "\n* epica-branch: %s\n"
+        (unless (bolp) (insert "\n"))
+        (insert (format "* epica-branch: %s\n"
                         (format-time-string "%Y%m%d-%H%M%S")))
         (insert (epica--demote tail)))))
   (epica--session-save))
@@ -890,13 +1094,11 @@ continuation is archived as a new `* epica-branch:' container."
     (dolist (sec (epica--level1-sections))
       (pcase (car sec)
         ('summary
-         (let ((start (epica--section-start sec))
-               (end (epica--section-end sec)))
-           (push (string-trim
-                  (buffer-substring-no-properties start end))
-                 summaries))))
-      ;; (no-op for other types)
-      )
+         (push (epica--decode-turn
+                (buffer-substring-no-properties
+                 (epica--section-start sec)
+                 (epica--section-body-end sec)))
+               summaries))))
     (nreverse summaries)))
 
 (defun epica--strip-org-markup (text)
@@ -908,7 +1110,9 @@ continuation is archived as a new `* epica-branch:' container."
             (unless (or (string-match-p "^\\*+ " line)
                         (string-match-p "^#\\+begin_example$" line)
                         (string-match-p "^#\\+end_example$" line))
-              line))
+              (if (string-prefix-p ": " line)
+                  (substring line 2)
+                line)))
           (split-string text "\n")))
    "\n"))
 
@@ -917,10 +1121,12 @@ continuation is archived as a new `* epica-branch:' container."
 Falls back to returning TEXT unchanged if the call fails or times out."
   (condition-case err
       (let ((buf (get-buffer-create " *epica-summarize*"))
+            (chosen-backend (or epica-backend gptel-backend))
+            (chosen-model (or epica-model gptel-model))
             (result nil) (done nil))
         (with-current-buffer buf
-          (setq-local gptel-backend epica-backend)
-          (setq-local gptel-model epica-model)
+          (setq-local gptel-backend chosen-backend)
+          (setq-local gptel-model chosen-model)
           (setq-local gptel-stream nil)
           (setq-local gptel-use-tools nil)
           (gptel-request text
@@ -940,45 +1146,154 @@ numbers, decisions, and the user's stated goals. 3-6 sentences."
      (message "epica: summarization failed: %S" err)
      (string-trim text))))
 
-;;;###autoload
-(defun epica-compact (&optional keep-last)
-  "Summarize the oldest turns into one `* epica-summary' heading.
-Keeps the last KEEP-LAST (default 4) MESSAGES as-is. Never crosses a
-branch container: compaction stops at the first container in range.
-Returns the summary text."
-  (interactive "P")
-  (let* ((keep (or keep-last 4))
+(defun epica--summarize-async (text callback)
+  "Summarize TEXT without blocking Emacs; call CALLBACK with (SUMMARY ERROR).
+On failure or timeout SUMMARY is nil, so the caller leaves its session
+untouched. The temporary request buffer is always cleaned up."
+  (let ((buf (generate-new-buffer " *epica-summarize*"))
+        (backend (or epica-backend gptel-backend))
+        (model (or epica-model gptel-model))
+        (timer nil)
+        (done nil))
+    (cl-labels ((finish (summary error-message)
+                  (unless done
+                    (setq done t)
+                    (when timer (cancel-timer timer))
+                    (when (buffer-live-p buf) (kill-buffer buf))
+                    (funcall callback summary error-message))))
+      (with-current-buffer buf
+        (setq-local gptel-backend backend)
+        (setq-local gptel-model model)
+        (setq-local gptel-stream nil)
+        (setq-local gptel-use-tools nil)
+        (condition-case err
+            (progn
+              (gptel-request text
+                :system "Summarize this agent conversation concisely, preserving facts, numbers, decisions and user goals."
+                :buffer buf
+                :callback (lambda (response info)
+                            (if (stringp response)
+                                (finish response nil)
+                              (finish nil (format "Summarization failed: %s"
+                                                  (or (plist-get info :status)
+                                                      "no response"))))))
+              (unless done
+                (setq timer (run-at-time
+                             120 nil
+                             (lambda ()
+                               (when (buffer-live-p buf) (gptel-abort buf))
+                               (finish nil "Summarization timed out"))))))
+          (error (finish nil (error-message-string err))))))))
+
+(defun epica--compact-region (keep-last)
+  "Return (START . END) of complete turns eligible for compaction.
+KEEP-LAST is the number of recent messages retained. Do not cross a
+branch container, or compact half of a user/assistant turn."
+  (let* ((keep (if keep-last (max 0 (prefix-numeric-value keep-last)) 4))
          (sections (epica--level1-sections))
          (active (cl-remove-if-not
                   (lambda (sec) (memq (car sec) '(user assistant)))
                   sections))
          (total (length active))
          (compact-count (- total (min keep total))))
-    (if (<= compact-count 0)
-        (progn (message "epica-compact: nothing to compact (%d messages)"
-                        total)
-               nil)
-      (let* ((region-start (epica--section-start (car active)))
-             (region-end (epica--section-end (nth (1- compact-count) active)))
-             (clamped-end region-end))
-        ;; stop before any container inside the region
-        (dolist (sec sections)
-          (when (and (eq (car sec) 'branch)
-                     (> (epica--section-start sec) region-start)
-                     (< (epica--section-start sec) region-end))
-            (setq clamped-end (min clamped-end (epica--section-start sec)))))
-        (let* ((plain (epica--strip-org-markup
-                       (buffer-substring-no-properties
-                        region-start clamped-end)))
-               (summary (epica--summarize plain)))
-          (save-excursion
-            (goto-char region-start)
-            (delete-region region-start clamped-end)
-            (insert (format "* epica-summary: %s\n%s\n"
-                            (format-time-string "%Y%m%d-%H%M%S")
-                            summary)))
-          (epica--session-save)
-          summary)))))
+    (when (> compact-count 0)
+      (let* ((region-start (epica--section-heading (car active)))
+             (candidates (cl-subseq active 0 compact-count))
+             (boundary (cl-find-if
+                        (lambda (sec)
+                          (and (eq (car sec) 'branch)
+                               (> (epica--section-heading sec) region-start)
+                               (< (epica--section-heading sec)
+                                  (epica--section-end (car (last candidates))))))
+                        sections))
+             (before-branch
+              (if boundary
+                  (cl-remove-if-not
+                   (lambda (sec)
+                     (< (epica--section-heading sec)
+                        (epica--section-heading boundary)))
+                   candidates)
+                candidates))
+             (count (* 2 (/ (length before-branch) 2))))
+        (when (> count 0)
+          (cons region-start
+                (epica--section-end (nth (1- count) before-branch))))))))
+
+(defun epica--insert-summary (start end summary)
+  "Replace session turns START through END with quoted SUMMARY."
+  (undo-boundary)
+  (atomic-change-group
+    (save-excursion
+      (goto-char start)
+      (delete-region start end)
+      (insert (format "* epica-summary: %s\n"
+                      (format-time-string "%Y%m%d-%H%M%S")))
+      (epica--render-quoted summary)))
+  (undo-boundary)
+  (epica--session-save))
+
+;;;###autoload
+(defun epica-compact-async (&optional keep-last callback)
+  "Compact older turns without blocking redisplay.
+Retain KEEP-LAST messages (default 4). Invoke CALLBACK with (SUMMARY
+ERROR) when finished; on failure or concurrent session edits, the
+original conversation is left unchanged."
+  (interactive "P")
+  (when (or epica--compacting epica--running)
+    (user-error "Wait for the active agent run or compaction to finish"))
+  (let ((range (epica--compact-region keep-last)))
+    (unless range
+      (user-error "No complete turns available for compaction"))
+    (let* ((session (current-buffer))
+           (start (copy-marker (car range)))
+           (end (copy-marker (cdr range) t))
+           (original (buffer-substring-no-properties start end))
+           (plain (epica--strip-org-markup original)))
+      (setq epica--compacting t)
+      (message "epica: compacting older turns in the background")
+      (condition-case err
+          (epica--summarize-async
+           plain
+           (lambda (summary error-message)
+             (when (buffer-live-p session)
+               (with-current-buffer session
+                 (setq epica--compacting nil)
+                 (let ((failure
+                        (or error-message
+                            (unless (equal original
+                                           (buffer-substring-no-properties
+                                            start end))
+                              "Session changed during compaction; retry"))))
+                   (if failure
+                       (message "epica: %s" failure)
+                     (epica--insert-summary start end summary)
+                     (message "epica: compacted older turns"))
+                   (when callback
+                     (funcall callback (unless failure summary) failure)))))
+             (set-marker start nil)
+             (set-marker end nil)))
+        (error
+         (setq epica--compacting nil)
+         (set-marker start nil)
+         (set-marker end nil)
+         (signal (car err) (cdr err)))))))
+
+;;;###autoload
+(defun epica-compact (&optional keep-last)
+  "Compact old turns, keeping KEEP-LAST (default 4) recent messages.
+Interactively this calls non-blocking `epica-compact-async'. Programmatic
+calls remain synchronous for batch scripts and compatibility."
+  (interactive "P")
+  (if (called-interactively-p 'interactive)
+      (epica-compact-async keep-last)
+    (when (or epica--compacting epica--running)
+      (user-error "Wait for the active agent run or compaction to finish"))
+    (when-let* ((range (epica--compact-region keep-last)))
+      (let* ((plain (epica--strip-org-markup
+                     (buffer-substring-no-properties (car range) (cdr range))))
+             (summary (epica--summarize plain)))
+        (epica--insert-summary (car range) (cdr range) summary)
+        summary))))
 
 
 
@@ -1030,9 +1345,16 @@ Handles simple scalar values and folded (>) descriptions."
 
 ;;;###autoload
 (defun epica-skill-scan ()
-  "Scan `epica-skills-dirs' for skills. Returns ((NAME . SKILL-MD-PATH) ...)."
-  (let ((found '()))
-    (dolist (dir epica-skills-dirs)
+  "Return ((NAME . SKILL-MD-PATH) ...) from project and global skills.
+Project-local .agents/skills takes precedence over `epica-skills-dirs'.
+Set `epica-skills-dirs' to nil to disable skill discovery entirely."
+  (let* ((found '())
+         (seen (make-hash-table :test #'equal))
+         (dirs (when epica-skills-dirs
+                 (cons (expand-file-name ".agents/skills/"
+                                         (epica--project-root))
+                       epica-skills-dirs))))
+    (dolist (dir dirs)
       (when (file-directory-p dir)
         (dolist (md (directory-files-recursively dir "SKILL\\.md$"))
           (let ((meta (epica--parse-frontmatter
@@ -1040,7 +1362,8 @@ Handles simple scalar values and folded (>) descriptions."
                          (insert-file-contents md)
                          (buffer-string)))))
             (let ((name (cdr (assoc "name" meta))))
-              (when name
+              (when (and name (not (gethash name seen)))
+                (puthash name t seen)
                 (push (cons name md) found)))))))
     (nreverse found)))
 
@@ -1135,6 +1458,7 @@ password <key> (typically in ~/.authinfo.gpg)."
   "Return a gptel DeepSeek backend.
 API-KEY overrides; otherwise `epica--deepseek-api-key' (env then
 auth-source). Requires an API key -- DeepSeek is not a local model."
+  (require 'gptel-openai-extras)
   (let ((key (or api-key (epica--deepseek-api-key))))
     (unless key
       (error "No DeepSeek API key: set DEEPSEEK_API_KEY (env or .env) or add an auth-source entry"))

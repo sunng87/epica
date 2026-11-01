@@ -2,6 +2,21 @@
 #+author: nsun
 #+options: toc:2 num:nil
 
+* Implementation status
+
+This document records both the working design and future ideas. Today,
+epica runs a gptel loop in file-visiting Org session buffers, edits live
+buffers with Emacs undo, has project-local skills and hook-driven tools,
+and offers asynchronous Eshell, webfetch, project search and interactive
+compaction. =test/run-offline.sh= covers deterministic behavior;
+=test/run-self-host-smoke.sh= verifies real local-model reads, edits,
+saves and an asynchronous tool call without cloud credentials.
+
+Still aspirational: proposed-edit overlays, stable read-to-edit region
+handles for concurrent human edits, and dedicated xref/imenu/flymake or
+eglot tools. Session state is buffer-local rather than an EIEIO class;
+gptel handles HTTP and streaming rather than a separate SSE filter.
+
 * Motivation
 
 epica is a coding-agent harness, in the family of tools like ~pi~, but
@@ -10,9 +25,9 @@ foundation.
 
 Concretely: where pi ships ~read~/~write~/~edit~/~bash~ operating on
 files off disk and a fresh bash process per call, epica uses
-*buffers*, *overlays*, *narrowing*, a *stateful eshell*, and Emacs'
-existing code-intelligence tooling (~xref~, ~project.el~, ~dired~,
-~magit~) as its tool layer.
+*buffers*, *narrowing*, a *stateful eshell*, and ~project.el~ as
+its current tool layer. Overlays and richer code-intelligence tools
+remain design goals.
 
 The design philosophy transfers directly: aggressively extensible,
 minimal core, everything else buildable as extensions. The deep insight
@@ -23,8 +38,8 @@ system" is not something we invent, it's hooks + advice + minor modes.
 
 - *Buffer-native tools.* The agent edits the buffer the user sees, not a
   file on disk that the user must re-open.
-- *Free undo.* Edits ride on ~buffer-undo-list~ / ~undo-tree~; proposed
-  edits render as overlays the user accepts or rejects.
+- *Free undo.* Edits ride on ~buffer-undo-list~ / ~undo-tree~;
+  proposed-edit overlays are a later extension.
 - *Stateful shell.* A persistent eshell session carries env, cwd, and
   defined functions across tool calls.
 - *Reuse Emacs' code intelligence.* ~xref~, ~project-find-regexp~,
@@ -52,20 +67,20 @@ These are the concrete, structural advantages — not aesthetics.
 1. *Live buffer edits.* pi's ~edit~ does exact-string match
    (~oldText~→~newText~) against a file on disk; fragile on whitespace
    and invisible to the user until re-opened. epica edits the live
-   buffer the user is viewing; undo is free; proposed edits show as
-   overlays to accept/reject.
+   buffer the user is viewing and undo is free. Overlay previews are
+   a future enhancement.
 2. *Narrowing as context management.* pi fakes "show the model part of
    the file" with ~offset~/~limit~ line math. Emacs has
    ~narrow-to-region~ — the agent's view and the user's view can be the
    same narrowed region.
-3. *Markers for edit stability.* If the buffer changes between plan and
-   apply (user typing, another edit landing), markers track. pi re-reads
-   and hopes the text still matches.
+3. *Potential marker-based edit stability.* Currently exact, unique
+   text matching prevents ambiguous edits; stable read-to-edit handles
+   are a planned extension for concurrent user edits.
 4. *Stateful eshell.* pi's ~bash~ is stateless by necessity. An eshell
    session buffer keeps real state across calls.
-5. *Code-intelligence tools for free.* ~xref-find-definitions~,
-   ~xref-find-references~, ~project-find-regexp~, ~imenu~, flymake/
-   eglot diagnostics become tools — no shell-out-and-parse.
+5. *A path to code-intelligence tools.* The optional project extension
+   uses project.el today; xref, imenu and diagnostics can later be
+   exposed without shell-out-and-parse shims.
 6. *The extension surface is Emacs itself.* pi had to invent a TS-module
    loader, an ~ExtensionAPI~, registration, hot-reload. Emacs already
    has ~define-minor-mode~, ~advice-add~, and hooks. Our "extensions"
@@ -80,15 +95,15 @@ the environment it was originally written for.
 
 | pi abstraction                        | epica (Emacs-native) equivalent                            |
 |---------------------------------------|------------------------------------------------------------|
-| ~AgentSession~ (lifecycle, history)   | EIEIO class + a conversation org buffer                    |
-| ~Agent~ (LLM loop)                    | Elisp non-blocking state machine (timers + SSE filters)    |
+| ~AgentSession~ (lifecycle, history)   | File-visiting Org buffer + buffer-local state              |
+| ~Agent~ (LLM loop)                    | gptel streaming callbacks + Elisp state                    |
 | ~ModelRuntime~ (30+ providers)        | =reused= via gptel                                          |
 | Session as JSONL tree                 | Org buffer: heading per turn, subtree = branch              |
-| ~read~ tool (file → string)           | ~epica-read-buffer~ (live buffer, respect narrowing)        |
-| ~edit~ tool (~oldText~/~newText~)     | ~epica-edit-region~ (overlay + ~buffer-undo-list~)          |
-| ~write~ tool                          | ~epica-write-buffer~ (~write-file~ / ~insert~)              |
+| ~read~ tool (file → string)           | ~open-file~ + ~read-buffer~ (live, narrowing-aware)         |
+| ~edit~ tool (~oldText~/~newText~)     | ~edit-region~ (unique match + ~buffer-undo-list~)           |
+| ~write~ tool                          | ~save-buffer~ / ~write-buffer~ (visiting buffers)            |
 | ~bash~ (stateless subprocess)         | ~epica-eshell-run~ (stateful session buffer)                |
-| ~grep~/~find~/~ls~                    | ~project-find-regexp~, ~xref~, ~dired~                      |
+| ~grep~/~find~/~ls~                    | Optional asynchronous ~project-search~ extension           |
 | Tools (typebox schema)                | ~define-epica-tool~ macro → JSON Schema plist               |
 | Extensions (TS modules + loader)      | Emacs packages + hooks + advice (no loader needed)          |
 | Events (~pi.on(...)~)                 | hooks: ~epica-tool-call-hook~, ~epica-turn-start-hook~…     |
@@ -182,8 +197,12 @@ Advantages:
   heading via an LLM call.
 - *Search/export* via normal Emacs.
 
-Storage: a plain ~.org~ file under ~epica-session-dir~ (default
-~~/.emacs.d/epica/sessions/~), named per project root like pi.
+Storage: a file-visiting ~.org~ buffer under ~epica-session-dir~ (default
+~~/.emacs.d/epica/sessions/~), namespaced per project root. The example
+above shows the conceptual tree; actual turn and tool payload lines use
+Org fixed-width ~: ~ quoting so literal headings in model output remain
+data. Sessions store their original project root for reliable resume;
+older sessions recover it from their namespaced path.
 
 ** Hooks (the extension surface)
 
@@ -543,13 +562,15 @@ Detailed findings from the spike (all now baked into ~test/spike/spike.el~):
       `define-epica-tool` (positional args), hooks fire from the tool
       wrapper (gptel-request doesn't run its pre/post hooks), explicit
       block contract.
-- [ ] Buffer ownership/locking convention for concurrent user + agent edits.
+- [ ] Stable read-to-edit region handles / ownership convention for
+      concurrent user + agent edits. v1 rejects ambiguous exact matches
+      and honors narrowing, but does not lock the buffer.
 - [ ] Token-counting strategy: approximate vs. call-out; where to place
       ~cache_control~ breakpoints.
 - [X] Conversation buffer format — RESOLVED by step 4: org-mode.
       Buys folding, search, export, and a human-readable session file.
-- [ ] Do we support multiple concurrent agent turns across buffers, or
-      one active session at a time in v1?
+- [X] One active run per session buffer in v1; different session buffers
+      may run concurrently. Late callbacks from a settled run are ignored.
 
 * References
 

@@ -1,20 +1,9 @@
-;;; epica-ui.el --- interactive commands + transient menu for epica -*- lexical-binding: t; -*-
-;;; epica-ui.el --- interactive commands + transient menu for epica -*- lexical-binding: t; -*-
+;;; epica-ui.el --- interactive commands and menu for epica -*- lexical-binding: t; -*-
 
-
-;; The interactive layer (build step 8): M-x commands, a transient
-;; The interactive layer (build step 8): M-x commands, a transient
-;; menu, and a minor mode for session buffers. Core (epica.el) stays
-;; menu, and a minor mode for session buffers. Core (epica.el) stays
-;; UI-free; this file is what a user loads to drive epica interactively.
-;; UI-free; this file is what a user loads to drive epica interactively.
-
+;; Prompt drafting, session keybindings and a transient menu.
 
 ;;; Code:
-;;; Code:
 
-
-(require 'epica)
 (require 'epica)
 (require 'epica-tools)
 (require 'subr-x)
@@ -33,15 +22,19 @@ The agent runs in the session buffer; type C-c C-s (in
     (message "epica: C-c C-s to send a prompt, C-c C-m for the menu")))
 
 ;;;###autoload
-(defun epica-send (prompt)
-  "Send PROMPT to the agent in the active session buffer (async).
+(defun epica-send (&optional prompt session)
+  "Send PROMPT to SESSION or the active session buffer (async).
 The answer streams into the session buffer as it is generated.
 Interactively (PROMPT nil), opens the prompt buffer to draft a
 multi-line prompt instead of reading the minibuffer."
   (interactive)
   (if (null prompt)
-      (epica-compose)
-    (let ((buf (epica--conv-buffer t)))
+      (if (called-interactively-p 'interactive)
+          (call-interactively #'epica-compose)
+        (epica-compose))
+    (let ((buf (or session (epica--conv-buffer t))))
+      (unless (buffer-live-p buf)
+        (user-error "The prompt's session is no longer available"))
       (pop-to-buffer buf)
       (epica-run prompt :buffer buf)
       (message "epica: agent started in %s" (buffer-name buf)))))
@@ -76,7 +69,7 @@ With MODEL (a string), set it directly."
 (defun epica-compact-session ()
   "Compact the current session's oldest turns (interactive wrapper)."
   (interactive)
-  (epica-compact 4))
+  (epica-compact-async 4))
 
 ;;; -------------------------------------------------- prompt buffer ------
 
@@ -123,13 +116,17 @@ shown afterwards so the answer streams in view."
   "Send the draft prompt to the agent and close the prompt window."
   (interactive)
   (let ((prompt (string-trim (buffer-string)))
+        (session epica-prompt--session-buffer)
         (win (get-buffer-window)))
     (when (string-empty-p prompt)
       (user-error "Empty prompt — nothing to send"))
+    (when (and (buffer-live-p session)
+               (buffer-local-value 'epica--running session))
+      (user-error "An epica run is already active; draft preserved"))
     (kill-buffer)
     (when (window-live-p win)
       (quit-window nil win))
-    (epica-send prompt)))
+    (epica-send prompt session)))
 
 (defun epica-prompt-cancel ()
   "Cancel the draft prompt without sending; close the prompt window."
